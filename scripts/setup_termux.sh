@@ -47,12 +47,21 @@ fi
 
 echo "==> [7/7] Installing the 'algobot' command"
 mkdir -p "$PREFIX/bin"
-if command -v algobot >/dev/null 2>&1; then
-    echo "algobot already installed; leaving it untouched."
-else
-    install -m 0755 scripts/algobot "$PREFIX/bin/algobot"
-    echo "Installed algobot -> $PREFIX/bin/algobot"
-fi
+# A plain copy of scripts/algobot can't know where the project lives once it's
+# in $PREFIX/bin (its own parent.parent points at /data/.../usr, not the repo).
+# Generate a wrapper that embeds the real project path and runs under the
+# project's venv interpreter (which has pydantic and the other deps).
+cat > "$PREFIX/bin/algobot" <<EOF
+#!$PROJECT_DIR/.venv/bin/python
+import sys
+PROJECT_DIR = "$PROJECT_DIR"
+sys.path.insert(0, PROJECT_DIR)
+from algotrading.cli_setup import main
+if __name__ == "__main__":
+    main()
+EOF
+chmod 0755 "$PREFIX/bin/algobot"
+echo "Installed algobot -> $PREFIX/bin/algobot"
 
 echo
 echo "Setup complete. Next steps:"
