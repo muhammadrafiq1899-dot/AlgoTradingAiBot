@@ -1,0 +1,26 @@
+# Starter strategy definitions.
+#
+# Each entry declares a strategy's parameter schema. The runtime values live in
+# the `strategies` DB table as versioned, approved params (seeded from here on
+# first init). The AI assistant proposes param diffs that must be approved
+# before a new version is activated.
+
+strategies:
+  - name: ema_crossover
+    description: >-
+      Long when fast EMA crosses above slow EMA, exit when it crosses below.
+      Pure trend-following, no leverage.
+    params:
+      - {name: fast_period, type: int, default: 12, min: 2, max: 200}
+      - {name: slow_period, type: int, default: 26, min: 5, max: 400}
+      - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}
+
+  - name: rsi_mean_reversion
+    description: >-
+      Buy when RSI dips below oversold and recovers, exit when RSI reaches
+      overbought. Mean-reverting, suited to ranging markets.
+    params:
+      - {name: period, type: int, default: 14, min: 2, max: 100}
+      - {name: oversold, type: float, default: 30.0, min: 5.0, max: 45.0}
+      - {name: overbought, type: float, default: 70.0, min: 55.0, max: 95.0}
+      - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}

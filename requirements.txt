@@ -1,0 +1,31 @@
+# AlgoTrading dependencies
+# Python 3.12+ recommended; 3.14 verified on Termux.
+
+# --- Core ---
+PyYAML>=6.0.1            # config files
+SQLAlchemy>=2.0.30       # ORM over SQLite (WAL mode)
+APScheduler>=3.10.4      # periodic jobs (v3 API, async-compatible)
+python-dotenv>=1.0.1     # .env secrets loading
+pydantic>=1.10.26        # v1 (pure Python); v2's Rust core doesn't build on Termux
+
+# --- Exchange connectivity ---
+# ccxt is NOT used: it hard-imports `cryptography` (Rust wheels unavailable on
+# Termux/Android). Instead we use a minimal Binance REST client (requests +
+# stdlib hmac/hashlib) in algotrading/market/binance_rest.py.
+requests>=2.31.0
+
+# --- Telegram interface ---
+python-telegram-bot>=21.6
+
+# --- Internal API (optional webhook/health) ---
+# <0.116: last major supporting pydantic v1 (v2's Rust core doesn't build on Termux)
+fastapi>=0.111.0,<0.116
+uvicorn>=0.30.0
+
+# --- AI layer (OpenAI-compatible cloud API) ---
+openai>=1.30.0
+
+# --- Development / tests ---
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0          # FastAPI TestClient

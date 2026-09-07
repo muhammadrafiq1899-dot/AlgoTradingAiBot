@@ -1,0 +1,50 @@
+# AlgoTrading main settings
+# Every value here is validated by pydantic in algotrading/config.py.
+
+# --- Trading mode ---
+# paper: simulated fills against live Binance public prices (no API keys needed)
+# live:  real orders via authenticated Binance API (requires keys + explicit review)
+mode: paper
+
+market:
+  exchange: binance
+  symbols:
+    - BTC/USDT
+    - ETH/USDT
+  intervals:
+    - 1m
+    - 1h
+  backfill_days: 30
+  poll_seconds: 60
+  max_staleness_seconds: 300
+
+risk:
+  paper_initial_balance: 10000.0
+  risk_per_trade_pct: 1.0
+  max_position_pct: 20.0
+  max_open_positions: 3
+  cooldown_seconds: 300
+  max_daily_loss_pct: 3.0
+  slippage_pct: 0.05
+
+schedule:
+  market_tick_seconds: 60
+  analytics_minutes: 30
+  daily_analytics_hour: 0
+  ai_review_hour: 6
+  reconcile_minutes: 15
+
+ai:
+  enabled: false          # auto-enabled when AI_API_KEY is set in .env
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+  temperature: 0.2
+  max_recommendations_per_review: 1
+
+# --- Internal HTTP API (optional health/status; requires API_TOKEN in .env) ---
+api:
+  enabled: false          # set true + API_TOKEN to expose /health and /status
+  host: 127.0.0.1         # keep loopback; never expose to the public internet
+  port: 8000
+
+log_level: INFO

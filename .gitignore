@@ -1,0 +1,24 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Environment / secrets ---
+.env
+!*.example
+
+# --- Runtime data ---
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/heartbeat
+logs/*.log
+*.pid
+*.heartbeat
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
