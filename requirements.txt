@@ -23,7 +23,10 @@ fastapi>=0.111.0,<0.116
 uvicorn>=0.30.0
 
 # --- AI layer (OpenAI-compatible cloud API) ---
-openai>=1.30.0
+# Uses `requests` directly against the /chat/completions JSON API (see
+# algotrading/ai/client.py). The `openai` SDK is NOT a dependency: it pulls in
+# the Rust-backed `jiter` package and pydantic v2's Rust core, neither of which
+# build on Termux/Android.
 
 # --- Development / tests ---
 pytest>=8.2.0
