@@ -45,9 +45,20 @@ else
     echo "termux-wake-lock not found — install termux-api (already requested above)."
 fi
 
+echo "==> [7/7] Installing the 'algobot' command"
+mkdir -p "$PREFIX/bin"
+if command -v algobot >/dev/null 2>&1; then
+    echo "algobot already installed; leaving it untouched."
+else
+    install -m 0755 scripts/algobot "$PREFIX/bin/algobot"
+    echo "Installed algobot -> $PREFIX/bin/algobot"
+fi
+
 echo
 echo "Setup complete. Next steps:"
-echo "  1. Edit .env  (TELEGRAM_BOT_TOKEN at minimum)"
-echo "  2. Review config/settings.yaml (mode: paper by default)"
-echo "  3. Run:  bash scripts/run_bot.sh"
-echo "     or:   .venv/bin/python -m algotrading.main --demo-data"
+echo "  1. Configure the bot (Telegram + optional AI key):"
+echo "        algobot setup"
+echo "  2. Start the bot:"
+echo "        algobot start            (paper mode, real Binance data)"
+echo "        algobot start --demo-data (offline demo, no network)"
+echo "  3. Check it later:  algobot status / algobot logs / algobot stop"

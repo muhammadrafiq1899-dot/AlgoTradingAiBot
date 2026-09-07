@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""The `algobot` command — start, stop, status, logs, setup for AlgoTrading.
+
+Installed to $PREFIX/bin/algobot by scripts/setup_termux.sh so it is available
+as a plain `algobot` command in Termux.
+
+Usage:
+    algobot            interactive menu
+    algobot start      start the bot in the background
+    algobot start --demo-data
+    algobot stop       stop the bot
+    algobot status     show current state
+    algobot logs [N]   show last N log lines (default 40)
+    algobot setup      run first-time configuration
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from algotrading.cli_setup import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    main()

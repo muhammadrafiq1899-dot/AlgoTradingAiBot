@@ -23,6 +23,11 @@ if [ ! -x "$PYTHON" ]; then
     exit 1
 fi
 
+# A heartbeat left over from a previous session would make the watchdog think
+# the freshly-started bot is stale and kill it before it can write its first
+# beat (first tick is ~60s). Clear it now so a new boot starts clean.
+rm -f "$HEARTBEAT"
+
 while true; do
     START=$(date +%s)
     "$PYTHON" -m algotrading.main "$@" &
