@@ -116,14 +116,12 @@ def _mask(value: str) -> str:
 
 
 def _input(prompt: str, secret: bool = False) -> str:
-    """Read a line from stdin, hiding secret input when possible."""
-    if secret:
-        # getpass suppresses echo; falls back to plain input if unavailable.
-        try:
-            import getpass
-            return getpass.getpass(prompt)
-        except Exception:
-            pass
+    """Read a line from stdin. Always plain input() so long-press paste works.
+
+    getpass() is NOT used for secrets: on Termux it opens /dev/tty directly and
+    reads there, bypassing stdin — pasted tokens (inserted into stdin) would
+    never arrive. Echo of the value is unavoidable in the Termux terminal.
+    """
     return input(prompt)
 
 
