@@ -110,6 +110,8 @@ class Position(Base):
     symbol: Mapped[str] = mapped_column(String(32), unique=True)
     qty: Mapped[float] = mapped_column(Float, default=0.0)
     avg_price: Mapped[float] = mapped_column(Float, default=0.0)
+    trailing_stop_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    highest_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

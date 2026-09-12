@@ -21,25 +21,28 @@ log = logging.getLogger(__name__)
 
 def build_application(
     settings: Settings,
-    session,
+    session_factory,
     controller=None,
 ) -> Application:
     """Build the Telegram Application with handlers bound to DB + settings.
 
     `controller` is an optional object exposing async `start()`/`stop()` used by
     /start_bot and /stop_bot. Pass None for pure status/read-only mode.
+
+    Each handler gets its own session from session_factory() to avoid
+    concurrent access issues and PendingRollbackError.
     """
     allowed_users = settings.telegram_allowed_users
     risk_cfg = settings.risk
 
     handlers = build_handlers(
-        session=session,
+        session_factory=session_factory,
         settings=settings,
         risk_cfg=risk_cfg,
         on_start=_make_start(controller),
         on_stop=_make_stop(controller),
-        on_approve=_make_approve(settings, session),
-        on_reject=_make_reject(session),
+        on_approve=_make_approve(settings, session_factory),
+        on_reject=_make_reject(session_factory),
         allowed_users=allowed_users,
     )
 
@@ -98,43 +101,56 @@ def _stored_candles(session, settings) -> list:
     ]
 
 
-def _make_approve(settings, session):
+def _make_approve(settings, session_factory):
     """Factory for the inline /approve callback.
 
     Runs the shadow backtest + controlled release via RecommendationStore.apply.
     Missing candles make the backtest a no-op (the version is still released).
+
+    Creates a new session per callback to avoid database locking issues.
     """
     async def approve(rec_id, update, context):
-        store = RecommendationStore(session)
-        rec = store.get(int(rec_id))
-        if rec is None:
-            return "recommendation not found."
-        candles = _stored_candles(session, settings)
+        session = session_factory()
         try:
-            strategy, result = store.apply(rec, candles=candles)
-        except ValueError as exc:
-            return f"apply failed: {exc}"
-        if strategy is None:
-            return "backtest did not meet threshold; auto-rejected."
-        if result is None:
-            return f"released as v{strategy.version} (no backtest data)."
-        return (
-            f"released as v{strategy.version} — {result.n_trades} trades, "
-            f"pnl {result.total_pnl:.2f}."
-        )
+            store = RecommendationStore(session)
+            rec = store.get(int(rec_id))
+            if rec is None:
+                return "recommendation not found."
+            candles = _stored_candles(session, settings)
+            try:
+                strategy, result = store.apply(rec, candles=candles)
+            except ValueError as exc:
+                return f"apply failed: {exc}"
+            if strategy is None:
+                return "backtest did not meet threshold; auto-rejected."
+            if result is None:
+                return f"released as v{strategy.version} (no backtest data)."
+            return (
+                f"released as v{strategy.version} — {result.n_trades} trades, "
+                f"pnl {result.total_pnl:.2f}."
+            )
+        finally:
+            session.close()
 
     return approve
 
 
-def _make_reject(session):
-    """Factory for the inline /reject callback (marks PENDING -> rejected)."""
+def _make_reject(session_factory):
+    """Factory for the inline /reject callback (marks PENDING -> rejected).
+
+    Creates a new session per callback to avoid database locking issues.
+    """
     async def reject(rec_id, update, context):
-        store = RecommendationStore(session)
-        rec = store.get(int(rec_id))
-        if rec is None:
-            return "recommendation not found."
-        store.mark_rejected(rec)
-        return "rejected."
+        session = session_factory()
+        try:
+            store = RecommendationStore(session)
+            rec = store.get(int(rec_id))
+            if rec is None:
+                return "recommendation not found."
+            store.mark_rejected(rec)
+            return "rejected."
+        finally:
+            session.close()
 
     return reject
 

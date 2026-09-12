@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import logging
 import signal
 import sys
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # Allow `python algotrading/main.py` from anywhere, not just `-m`.
@@ -26,11 +26,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from algotrading.config import Settings, get_secret, load_settings  # noqa: E402
+from algotrading.config import Settings, get_secret, load_settings, validate_settings  # noqa: E402
 from algotrading.db import get_session, get_session_factory, init_db  # noqa: E402
 from algotrading.db.seed import ensure_seeded  # noqa: E402
 from algotrading.execution import LiveGateway, PaperGateway  # noqa: E402
 from algotrading.ledger import Ledger  # noqa: E402
+from algotrading.logging_config import setup_logging  # noqa: E402
 from algotrading.market.binance_provider import BinanceMarketProvider  # noqa: E402
 from algotrading.market.demo import DemoProvider  # noqa: E402
 from algotrading.scheduler import BotContext, build_scheduler  # noqa: E402
@@ -55,27 +56,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run without the Telegram control surface (headless).",
     )
     return parser.parse_args(argv)
-
-
-# --- logging -----------------------------------------------------------------
-
-def setup_logging(settings: Settings) -> None:
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    root = logging.getLogger()
-    root.setLevel(settings.log_level.upper())
-
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
-    root.addHandler(console)
-
-    logfile = RotatingFileHandler(
-        str(Path(settings.log_dir) / "algotrading.log"),
-        maxBytes=5_000_000,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    logfile.setFormatter(fmt)
-    root.addHandler(logfile)
 
 
 # --- components --------------------------------------------------------------
@@ -149,15 +129,15 @@ def _make_recommendation_pusher(app, allowed_users: list[int], loop: asyncio.Abs
 
     async def _push(rec) -> None:
         text = (
-            f"🤖 *AI proposal #{rec.id}* [{rec.kind}] for {rec.strategy_name}:\n"
-            f"{rec.rationale or '(no rationale)'}"
+            f"🤖 <b>AI proposal #{rec.id}</b> [{rec.kind}] for {rec.strategy_name}:\n"
+            f"{html.escape(rec.rationale or '(no rationale)')}"
         )
         for chat_id in allowed_users:
             try:
                 await app.bot.send_message(
                     chat_id=chat_id,
                     text=text,
-                    parse_mode="MarkdownV2",
+                    parse_mode="HTML",
                     reply_markup=approval_keyboard(rec.id),
                 )
             except Exception:  # noqa: BLE001 - alert failures must not crash the loop
@@ -196,7 +176,6 @@ async def run(settings: Settings, demo: bool, no_telegram: bool) -> None:
     )
 
     tg_app = None
-    tg_session = None
     controller = AppController(scheduler)
     loop = asyncio.get_running_loop()
 
@@ -204,8 +183,11 @@ async def run(settings: Settings, demo: bool, no_telegram: bool) -> None:
     if not no_telegram and get_secret("telegram_token"):
         from algotrading.telegram.bot import build_application
 
-        tg_session = get_session_factory(settings.db_path)()
-        tg_app = build_application(settings, tg_session, controller=controller)
+        tg_app = build_application(
+            settings,
+            get_session_factory(settings.db_path),
+            controller=controller,
+        )
         ctx.on_recommendation = _make_recommendation_pusher(
             tg_app, settings.telegram_allowed_users, loop
         )
@@ -255,7 +237,10 @@ async def run(settings: Settings, demo: bool, no_telegram: bool) -> None:
         pass
 
     log.info("shutting down…")
-    scheduler.shutdown(wait=False)
+    # wait=True: let an in-flight job (e.g. a slow market_tick) finish before
+    # teardown, so the process actually exits after "bye" instead of lingering
+    # on the scheduler's worker threads (which confused the watchdog/restarts).
+    scheduler.shutdown(wait=True)
 
     if api_task is not None:
         api_task.cancel()
@@ -268,15 +253,19 @@ async def run(settings: Settings, demo: bool, no_telegram: bool) -> None:
         await tg_app.updater.stop()
         await tg_app.stop()
         await tg_app.shutdown()
-    if tg_session is not None:
-        tg_session.close()
     log.info("bye")
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     settings = load_settings()
-    setup_logging(settings)
+    validate_settings(settings)
+    setup_logging(
+        log_level=settings.log_level,
+        log_dir=settings.log_dir,
+        log_format=settings.log_format,
+        json_fields=settings.log_json_fields,
+    )
 
     if not args.demo_data:
         ensure_wake_lock()

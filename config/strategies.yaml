@@ -24,3 +24,64 @@ strategies:
       - {name: oversold, type: float, default: 30.0, min: 5.0, max: 45.0}
       - {name: overbought, type: float, default: 70.0, min: 55.0, max: 95.0}
       - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}
+
+  - name: bb_mean_reversion
+    description: >-
+      Buy when price closes below lower Bollinger Band and recovers above it.
+      Exit at middle band (default) or upper band. Mean-reverting, suited to
+      ranging markets with volatility expansion/contraction.
+    params:
+      - {name: period, type: int, default: 20, min: 5, max: 100}
+      - {name: num_std, type: float, default: 2.0, min: 1.0, max: 4.0}
+      - {name: exit_at_middle, type: bool, default: true}
+      - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}
+
+  - name: macd_trend
+    description: >-
+      Trend-following using MACD: buy on bullish MACD/signal cross, sell on
+      bearish cross. Works well in trending markets, avoids chop in ranges.
+    params:
+      - {name: fast, type: int, default: 12, min: 2, max: 50}
+      - {name: slow, type: int, default: 26, min: 5, max: 100}
+      - {name: signal, type: int, default: 9, min: 3, max: 50}
+      - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}
+
+  - name: supertrend
+    description: >-
+      SuperTrend ATR-based trend follower: buy when trend flips bullish,
+      sell when flips bearish. Trailing stop built-in via ATR multiplier.
+    params:
+      - {name: period, type: int, default: 10, min: 2, max: 50}
+      - {name: multiplier, type: float, default: 3.0, min: 1.0, max: 10.0}
+      - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}
+
+  - name: vwap_reclaim
+    description: >-
+      Volume-weighted mean-reversion: buy when price reclaims session VWAP
+      from below, sell when it loses VWAP from above. Best on lower timeframes
+      with good volume.
+    params:
+      - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}
+
+  - name: multi_tf_ema
+    description: >-
+      Multi-timeframe EMA: higher TF (1h) for trend filter, lower TF (15m)
+      for entry signals. Only trades in direction of higher TF trend.
+    params:
+      - {name: trend_interval, type: str, default: "1h"}
+      - {name: trend_fast, type: int, default: 9, min: 2, max: 50}
+      - {name: trend_slow, type: int, default: 21, min: 5, max: 100}
+      - {name: entry_interval, type: str, default: "15m"}
+      - {name: entry_fast, type: int, default: 5, min: 2, max: 20}
+      - {name: entry_slow, type: int, default: 13, min: 5, max: 50}
+      - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}
+
+  - name: ensemble
+    description: >-
+      Combine multiple strategies with voting/filtering logic.
+      Modes: consensus (all agree), any (any triggers), filter (primary gated by filters),
+      weighted (weighted by position_pct).
+    params:
+      - {name: mode, type: str, default: "consensus", enum: ["consensus", "any", "filter", "weighted"]}
+      - {name: components, type: list, default: [{"name": "ema_crossover", "params": {"fast_period": 12, "slow_period": 26, "position_pct": 0.2}}, {"name": "rsi_mean_reversion", "params": {"period": 14, "oversold": 30, "overbought": 70, "position_pct": 0.2}}]}
+      - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}

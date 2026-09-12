@@ -16,9 +16,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import random
 import time
 import urllib.parse
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import requests
 
@@ -28,9 +29,68 @@ SPOT_BASE = "https://api.binance.com"
 TESTNET_BASE = "https://testnet.binance.vision"
 DEFAULT_TIMEOUT = 15
 
+# Retry configuration
+RETRY_MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 1.0      # seconds
+RETRY_MAX_DELAY = 30.0      # seconds
+RETRY_EXPONENTIAL_BASE = 2.0
+RETRY_JITTER = 0.3          # 30% jitter
+
 
 class BinanceError(RuntimeError):
     """Raised on a non-2xx Binance response or malformed payload."""
+
+    def __init__(self, message: str, status_code: int | None = None, retryable: bool = False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Determine if an error is retryable."""
+    if isinstance(exc, BinanceError):
+        # Retry on 429 (rate limit), 5xx (server errors), network errors
+        if exc.status_code is not None:
+            return exc.status_code == 429 or exc.status_code >= 500
+        # Network errors (no status code) are retryable
+        return True
+    if isinstance(exc, requests.RequestException):
+        return True
+    return False
+
+
+def _retry_delay(attempt: int) -> float:
+    """Calculate delay with exponential backoff and jitter."""
+    delay = min(RETRY_BASE_DELAY * (RETRY_EXPONENTIAL_BASE ** attempt), RETRY_MAX_DELAY)
+    jitter = delay * RETRY_JITTER * (random.random() * 2 - 1)  # ±30%
+    return max(0, delay + jitter)
+
+
+T = TypeVar("T")
+
+
+def with_retry(func: Callable[..., T]) -> Callable[..., T]:
+    """Decorator that retries a function with exponential backoff on retryable errors."""
+    def wrapper(*args, **kwargs) -> T:
+        last_exc: Exception | None = None
+        for attempt in range(RETRY_MAX_ATTEMPTS):
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < RETRY_MAX_ATTEMPTS - 1 and _is_retryable_error(exc):
+                    delay = _retry_delay(attempt)
+                    log.warning(
+                        "Binance request failed (attempt %d/%d): %s; retrying in %.1fs",
+                        attempt + 1, RETRY_MAX_ATTEMPTS, exc, delay
+                    )
+                    time.sleep(delay)
+                    continue
+                # Non-retryable or last attempt - raise
+                raise
+        # Should not reach here, but just in case
+        raise last_exc  # type: ignore[misc]
+    return wrapper
 
 
 class BinanceRestClient:
@@ -63,6 +123,7 @@ class BinanceRestClient:
         ).hexdigest()
         return p
 
+    @with_retry
     def _get(self, path: str, params: dict[str, Any] | None = None, signed: bool = False) -> Any:
         url = self._base + path
         headers = {"X-MBX-APIKEY": self._key} if signed else {}
@@ -71,9 +132,10 @@ class BinanceRestClient:
         try:
             resp = self._session.get(url, params=params, headers=headers, timeout=self._timeout)
         except requests.RequestException as exc:
-            raise BinanceError(f"network error on GET {path}: {exc}") from exc
+            raise BinanceError(f"network error on GET {path}: {exc}", retryable=True) from exc
         return self._handle(resp)
 
+    @with_retry
     def _post(self, path: str, params: dict[str, Any] | None = None, signed: bool = True) -> Any:
         url = self._base + path
         headers = {"X-MBX-APIKEY": self._key} if signed else {}
@@ -82,9 +144,10 @@ class BinanceRestClient:
         try:
             resp = self._session.post(url, params=params, headers=headers, timeout=self._timeout)
         except requests.RequestException as exc:
-            raise BinanceError(f"network error on POST {path}: {exc}") from exc
+            raise BinanceError(f"network error on POST {path}: {exc}", retryable=True) from exc
         return self._handle(resp)
 
+    @with_retry
     def _delete(self, path: str, params: dict[str, Any] | None = None, signed: bool = True) -> Any:
         url = self._base + path
         headers = {"X-MBX-APIKEY": self._key} if signed else {}
@@ -93,7 +156,7 @@ class BinanceRestClient:
         try:
             resp = self._session.delete(url, params=params, headers=headers, timeout=self._timeout)
         except requests.RequestException as exc:
-            raise BinanceError(f"network error on DELETE {path}: {exc}") from exc
+            raise BinanceError(f"network error on DELETE {path}: {exc}", retryable=True) from exc
         return self._handle(resp)
 
     @staticmethod
@@ -103,7 +166,9 @@ class BinanceRestClient:
                 err = resp.json()
             except ValueError:
                 err = {"msg": resp.text[:200]}
-            raise BinanceError(f"Binance {resp.status_code}: {err}")
+            # Determine if error is retryable
+            retryable = resp.status_code == 429 or resp.status_code >= 500
+            raise BinanceError(f"Binance {resp.status_code}: {err}", status_code=resp.status_code, retryable=retryable)
         try:
             return resp.json()
         except ValueError as exc:

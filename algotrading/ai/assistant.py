@@ -18,13 +18,13 @@ from algotrading.ai.client import AIClient, RecommendationError, extract_json
 from algotrading.ai.prompt_builder import build_prompt
 from algotrading.db.models import AIRecommendation
 from algotrading.market.base import Candle
-from algotrading.store.recommendations import PENDING
+from algotrading.store.recommendations import (
+    ALLOWED_KINDS,
+    ALLOWED_STRATEGY_NAMES,
+    PENDING,
+)
 
 log = logging.getLogger(__name__)
-
-_ALLOWED_KINDS = {"param_change", "new_strategy", "hypothesis", "failure_analysis"}
-# Must match the registry names in algotrading/strategy/starters.py
-_ALLOWED_NAMES = {"ema_crossover", "rsi_mean_reversion"}
 
 
 class Assistant:
@@ -43,13 +43,11 @@ class Assistant:
         never reaches the DB.
         """
         kind = data.get("kind")
-        if kind not in _ALLOWED_KINDS:
+        if kind not in ALLOWED_KINDS:
             raise RecommendationError(f"unknown kind {kind!r}")
 
         name = data.get("strategy_name") or self._strategy_name
-        if name not in _ALLOWED_NAMES:
-            raise RecommendationError(f"unknown strategy_name {name!r}")
-
+        
         content = data.get("content") or {}
         if not isinstance(content, dict):
             raise RecommendationError("content must be a JSON object")
@@ -57,6 +55,22 @@ class Assistant:
         params = content.get("params") or {}
         if not isinstance(params, dict):
             raise RecommendationError("content.params must be a JSON object")
+
+        # Validate ensemble/filter strategy params
+        if kind in ("ensemble_strategy", "filter_strategy"):
+            if name != "ensemble":
+                raise RecommendationError(f"{kind} requires strategy_name='ensemble'")
+            components = params.get("components")
+            if not isinstance(components, list) or len(components) < 2:
+                raise RecommendationError(f"{kind} requires 'components' list with >=2 strategies")
+            for comp in components:
+                if not isinstance(comp, dict) or "name" not in comp:
+                    raise RecommendationError("each component must have 'name' and 'params'")
+                if comp["name"] not in ALLOWED_STRATEGY_NAMES - {"ensemble"}:
+                    raise RecommendationError(f"unknown component strategy: {comp['name']}")
+        else:
+            if name not in ALLOWED_STRATEGY_NAMES:
+                raise RecommendationError(f"unknown strategy_name {name!r}")
 
         # For a plain hypothesis there is no params change.
         return {

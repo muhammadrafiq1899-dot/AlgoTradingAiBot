@@ -31,16 +31,26 @@ from algotrading.telegram.ui import (
 
 
 @pytest.fixture()
-def session(tmp_path):
+def session_factory(tmp_path):
     db = str(tmp_path / "tg.db")
     init_db(db)
-    sess = get_session_factory(db)()
+    factory = get_session_factory(db)
+    # Seed initial data
+    sess = factory()
     sess.add(
         Strategy(name="ema_crossover", version=1, status="active",
                  params=json.dumps({"fast_period": 12, "slow_period": 26, "position_pct": 0.2}))
     )
     sess.add(Position(symbol="BTC/USDT", qty=0.25, avg_price=50000.0))
     sess.commit()
+    sess.close()
+    yield factory
+
+
+@pytest.fixture()
+def session(session_factory):
+    """Backward compat: provide a session for direct DB access in tests."""
+    sess = session_factory()
     yield sess
     sess.close()
 
@@ -87,13 +97,13 @@ async def _run(handler, update, context=None):
     await handler.callback(update, context or AsyncMock())
 
 
-def _handlers(session, allowed=(1, 2)):
+def _handlers(session_factory, allowed=(1, 2)):
     settings = type("S", (), {"mode": "paper"})()
     risk = RiskConfig()
     return {
         next(iter(h.commands)): h
         for h in build_handlers(
-            session=session,
+            session_factory=session_factory,
             settings=settings,
             risk_cfg=risk,
             allowed_users=allowed,
@@ -143,15 +153,15 @@ def test_approval_keyboard():
     assert [b["callback_data"] for b in rows[0]] == ["approve:42", "reject:42"]
 
 
-def test_allowlisted_user_can_status(session):
-    handlers = _handlers(session, allowed=(1,))
+def test_allowlisted_user_can_status(session_factory):
+    handlers = _handlers(session_factory, allowed=(1,))
     update = FakeUpdate(user_id=1)
     asyncio.run(_run(handlers["status"], update))
     assert update.effective_message._sent, "allowed user should get a reply"
 
 
-def test_outsider_gets_no_reply(session):
-    handlers = _handlers(session, allowed=(1,))
+def test_outsider_gets_no_reply(session_factory):
+    handlers = _handlers(session_factory, allowed=(1,))
     update = FakeUpdate(user_id=999)
     asyncio.run(_run(handlers["status"], update))
     assert not update.effective_message._sent, "outsider must be silently ignored"
@@ -198,14 +208,14 @@ def _pending_rec(session):
     return rec
 
 
-def _approval_handlers(session):
+def _approval_handlers(session_factory):
     settings = _fake_settings()
     return build_handlers(
-        session=session,
+        session_factory=session_factory,
         settings=settings,
         risk_cfg=RiskConfig(),
-        on_approve=_make_approve(settings, session),
-        on_reject=_make_reject(session),
+        on_approve=_make_approve(settings, session_factory),
+        on_reject=_make_reject(session_factory),
         allowed_users=(1,),
     )
 
@@ -220,10 +230,10 @@ async def _click(handler, data):
     return update.callback_query
 
 
-def test_approve_releases_strategy_version(session):
+def test_approve_releases_strategy_version(session_factory, session):
     _seed_candles(session)
     rec = _pending_rec(session)
-    handlers = _approval_handlers(session)
+    handlers = _approval_handlers(session_factory)
     q = asyncio.run(_click(_find_callback(handlers), f"approve:{rec.id}"))
 
     session.refresh(rec)
@@ -234,9 +244,9 @@ def test_approve_releases_strategy_version(session):
     assert any("released" in text for text, _ in q.message._sent), q.message._sent
 
 
-def test_reject_marks_recommendation_rejected(session):
+def test_reject_marks_recommendation_rejected(session_factory, session):
     rec = _pending_rec(session)
-    handlers = _approval_handlers(session)
+    handlers = _approval_handlers(session_factory)
     q = asyncio.run(_click(_find_callback(handlers), f"reject:{rec.id}"))
 
     session.refresh(rec)
@@ -244,7 +254,7 @@ def test_reject_marks_recommendation_rejected(session):
     assert any("rejected" in text for text, _ in q.message._sent), q.message._sent
 
 
-def test_approve_missing_recommendation(session):
-    handlers = _approval_handlers(session)
+def test_approve_missing_recommendation(session_factory):
+    handlers = _approval_handlers(session_factory)
     q = asyncio.run(_click(_find_callback(handlers), "approve:999"))
     assert any("not found" in text for text, _ in q.message._sent), q.message._sent

@@ -116,7 +116,7 @@ def market_tick(ctx: BotContext) -> None:
         if not snapshot:
             return
 
-        engine = StrategyEngine(session)
+        engine = StrategyEngine(session, ctx.settings)
         candidates = engine.evaluate(snapshot)
         if not candidates:
             return
@@ -128,6 +128,21 @@ def market_tick(ctx: BotContext) -> None:
                 execution.execute(sig.id)
             except Exception:  # noqa: BLE001 - a failed order must not stop the tick
                 log.exception("market tick: execution failed for signal %s", sig.id)
+
+        # Update trailing stops (if enabled) after all fills
+        trailing_pct = settings.risk.trailing_stop_pct
+        if trailing_pct and trailing_pct > 0:
+            try:
+                # Get current prices from latest candles
+                current_prices = {}
+                for symbol in settings.market.symbols:
+                    latest = store.latest(symbol, eval_interval)
+                    if latest:
+                        current_prices[symbol] = latest.close
+                if current_prices:
+                    execution.update_trailing_stops(current_prices)
+            except Exception:  # noqa: BLE001
+                log.exception("market tick: trailing stop update failed")
     finally:
         session.close()
 
@@ -171,7 +186,7 @@ def analytics_tick(ctx: BotContext) -> None:
     session = ctx.session_factory()
     try:
         strategy_id = None
-        active = StrategyEngine(session).get_active_strategy()
+        active = StrategyEngine(session, ctx.settings).get_active_strategy()
         if active is not None:
             strategy_id = active.id
         AnalyticsService(session, period="30m",
@@ -207,7 +222,7 @@ def ai_review(ctx: BotContext) -> None:
             log.info("ai_review: PENDING recommendation exists; skipping proposal")
             return
 
-        engine = StrategyEngine(session)
+        engine = StrategyEngine(session, ctx.settings)
         active = engine.get_active_strategy()
         if active is None:
             log.warning("ai_review: no active strategy; skipping")

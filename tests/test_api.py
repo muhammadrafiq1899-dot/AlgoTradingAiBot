@@ -1,5 +1,6 @@
 """M7: internal API — /health is open, /status requires the bearer token."""
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,18 +18,34 @@ def client(tmp_path):
     init_db(db)
     factory = get_session_factory(db)
     session = factory()
-    session.add(
-        Strategy(name="ema_crossover", version=1, status="active",
-                 params=json.dumps({"fast_period": 12, "slow_period": 26, "position_pct": 0.2}))
-    )
+    session.add(Strategy(name="ema_crossover", version=1, status="active",
+                 params=json.dumps({"fast_period": 12, "slow_period": 26, "position_pct": 0.2})))
+    # Add candles for both default symbols so market freshness check passes
+    from algotrading.db.models import Candle
+    now_ms = int(time.time() * 1000)
+    for sym in ["BTC/USDT", "ETH/USDT"]:
+        session.add(Candle(
+            symbol=sym,
+            interval="1m",
+            ts=now_ms,
+            open=50000.0,
+            high=50100.0,
+            low=49900.0,
+            close=50050.0,
+            volume=1.0,
+        ))
     session.commit()
     session.close()
 
     settings = Settings(mode="paper", db_path=db)
+    # Create heartbeat file so scheduler check passes
+    heartbeat_path = str(tmp_path / "heartbeat")
+    import pathlib
+    pathlib.Path(heartbeat_path).touch()
     app = build_api(
         settings,
         factory,
-        HealthMonitor(str(tmp_path / "heartbeat")),
+        HealthMonitor(heartbeat_path),
         token="sekrit",
     )
     return TestClient(app)
@@ -40,8 +57,11 @@ def test_health_is_open(client):
     body = resp.json()
     assert body["status"] == "ok"
     assert body["mode"] == "paper"
-    assert body["db"] == "ok"
-    assert "heartbeat_age_s" in body
+    assert body["db"]["status"] == "ok"
+    assert "latency_ms" in body["db"]
+    assert "heartbeat_age_s" in body["scheduler"]
+    assert "market" in body
+    assert "scheduler" in body
 
 
 def test_status_requires_token(client):

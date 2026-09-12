@@ -32,6 +32,76 @@ APPROVED = "approved"
 REJECTED = "rejected"
 APPLIED = "applied"
 
+# Recommendation kinds the LLM (daily assistant OR chat orchestrator) may emit.
+ALLOWED_KINDS = {
+    "param_change",
+    "new_strategy",
+    "hypothesis",
+    "failure_analysis",
+    "ensemble_strategy",
+    "filter_strategy",
+}
+# Must match the registry names in algotrading/strategy/starters.py
+ALLOWED_STRATEGY_NAMES = {
+    "ema_crossover",
+    "rsi_mean_reversion",
+    "bb_mean_reversion",
+    "macd_trend",
+    "supertrend",
+    "vwap_reclaim",
+    "multi_tf_ema",
+    "ensemble",
+}
+
+
+def create_pending_recommendation(
+    session: Session,
+    *,
+    kind: str,
+    strategy_name: str,
+    params: dict[str, Any],
+    rationale: str = "",
+    position_pct: float | None = None,
+) -> AIRecommendation:
+    """Validate and persist a PENDING recommendation (human approval required).
+
+    Shared by the daily AI review and the chat orchestrator. Raises ValueError
+    on anything that must never reach the DB; never applies anything.
+    """
+    if kind not in ALLOWED_KINDS:
+        raise ValueError(f"unknown kind {kind!r}")
+    
+    # Validate ensemble/filter strategy params
+    if kind in ("ensemble_strategy", "filter_strategy"):
+        if strategy_name != "ensemble":
+            raise ValueError(f"{kind} requires strategy_name='ensemble'")
+        if not isinstance(params, dict):
+            raise ValueError("params must be a dict")
+        components = params.get("components")
+        if not isinstance(components, list) or len(components) < 2:
+            raise ValueError(f"{kind} requires 'components' list with >=2 strategies")
+        for comp in components:
+            if not isinstance(comp, dict) or "name" not in comp:
+                raise ValueError("each component must have 'name' and 'params'")
+            if comp["name"] not in ALLOWED_STRATEGY_NAMES - {"ensemble"}:
+                raise ValueError(f"unknown component strategy: {comp['name']}")
+    else:
+        if strategy_name not in ALLOWED_STRATEGY_NAMES:
+            raise ValueError(f"unknown strategy_name {strategy_name!r}")
+        if not isinstance(params, dict):
+            raise ValueError("params must be a dict")
+
+    rec = AIRecommendation(
+        kind=kind,
+        strategy_name=strategy_name,
+        content_json=json.dumps({"params": params, "position_pct": position_pct}),
+        status=PENDING,
+        rationale=rationale or "",
+    )
+    session.add(rec)
+    session.commit()
+    return rec
+
 
 class RecommendationStore:
     def __init__(self, session: Session):

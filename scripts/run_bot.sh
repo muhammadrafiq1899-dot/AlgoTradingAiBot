@@ -17,16 +17,46 @@ HEARTBEAT=data/heartbeat
 MAX_STALE_SECONDS=300
 MAX_RESTART_DELAY=60
 RESTART_DELAY=5
+LOCKFILE=data/run_bot.lock
+DB_FILE=data/algotrading.db
+BACKUP_DIR=data/backups
+BACKUP_RETENTION_DAYS=7
 
 if [ ! -x "$PYTHON" ]; then
     echo "No .venv found — run: bash scripts/setup_termux.sh" >&2
     exit 1
 fi
 
+# Single-instance guard: only one supervisor loop may run. A second start
+# (e.g. algobot start + a manual bash scripts/run_bot.sh) would create two
+# polling bots fighting over the same token and heartbeat file.
+if [ -f "$LOCKFILE" ] && kill -0 "$(cat "$LOCKFILE" 2>/dev/null)" 2>/dev/null; then
+    echo "run_bot.sh is already running (pid $(cat "$LOCKFILE" 2>/dev/null)) — not starting a second supervisor." >&2
+    exit 1
+fi
+echo $$ > "$LOCKFILE"
+trap 'rm -f "$LOCKFILE"' EXIT
+
 # A heartbeat left over from a previous session would make the watchdog think
 # the freshly-started bot is stale and kill it before it can write its first
 # beat (first tick is ~60s). Clear it now so a new boot starts clean.
 rm -f "$HEARTBEAT"
+
+# Ensure backup directory exists
+mkdir -p "$BACKUP_DIR"
+
+# Cleanup old backups (older than BACKUP_RETENTION_DAYS)
+find "$BACKUP_DIR" -type f -name "algotrading-*.db" -mtime +"$BACKUP_RETENTION_DAYS" -delete 2>/dev/null || true
+
+# Create SQLite backup before each start (point-in-time recovery)
+if [ -f "$DB_FILE" ]; then
+    BACKUP_NAME="algotrading-$(date -u +%F-%H%M%S).db"
+    if "$PYTHON" -c "import sqlite3; sqlite3.connect('$DB_FILE').backup(sqlite3.connect('$BACKUP_DIR/$BACKUP_NAME'))" 2>/dev/null; then
+        echo "[$(date -u +%H:%M:%S)] DB backed up to $BACKUP_DIR/$BACKUP_NAME"
+    else
+        echo "[$(date -u +%H:%M:%S)] WARNING: DB backup failed (continuing anyway)" >&2
+    fi
+fi
 
 while true; do
     START=$(date +%s)
@@ -36,8 +66,12 @@ while true; do
 
     # Watchdog: wait for the bot to exit, but also restart it if the
     # heartbeat goes stale while the process is still alive.
+    # Grace period: never kill before MAX_STALE_SECONDS of uptime — a slow
+    # boot (e.g. wake-lock or network stall) must not be killed before it
+    # writes its first heartbeat.
     while kill -0 "$BOT_PID" 2>/dev/null; do
-        if [ -f "$HEARTBEAT" ]; then
+        UPTIME=$(( $(date +%s) - START ))
+        if [ -f "$HEARTBEAT" ] && [ "$UPTIME" -gt "$MAX_STALE_SECONDS" ]; then
             AGE=$(( $(date +%s) - $(stat -c %Y "$HEARTBEAT") ))
             if [ "$AGE" -gt "$MAX_STALE_SECONDS" ]; then
                 echo "[$(date -u +%H:%M:%S)] heartbeat stale (${AGE}s) — killing bot" >&2

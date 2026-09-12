@@ -89,13 +89,13 @@ def format_status(
 
     active = next((s for s in strategies if s.status == "active"), None)
     mode = settings.mode if hasattr(settings, "mode") else "paper"
-    lines.append(f"*AlgoTrading — mode: {mode}*")
+    lines.append(f"<b>AlgoTrading — mode: {mode}</b>")
     if active:
         lines.append(f"Active strategy: {active.name} v{active.version}")
 
     # Positions with live mark-to-market
     if positions:
-        lines.append("\n*Positions*")
+        lines.append("\n<b>Positions</b>")
         for p in positions:
             mark = prices.get(p.symbol)
             u = _unrealized(p, mark)
@@ -108,12 +108,12 @@ def format_status(
 
     # Recent fills / intents
     if intents:
-        lines.append("\n*Recent activity*")
+        lines.append("\n<b>Recent activity</b>")
         lines.extend(_i(x) for x in intents[:8])
 
     # Closed trades today
     if trades:
-        lines.append("\n*Today's closed trades*")
+        lines.append("\n<b>Today's closed trades</b>")
         lines.extend(_t(x) for x in trades[:5])
 
     return "\n".join(lines)
@@ -122,7 +122,7 @@ def format_status(
 def format_risk(settings, risk_cfg, session) -> str:
     """Compact risk-limit summary for /risk."""
     lines = [
-        "*Risk limits*",
+        "<b>Risk limits</b>",
         f"• Risk per trade: {risk_cfg.risk_per_trade_pct}%",
         f"• Max position: {risk_cfg.max_position_pct}% of equity",
         f"• Max open positions: {risk_cfg.max_open_positions}",
@@ -140,14 +140,14 @@ def format_risk(settings, risk_cfg, session) -> str:
 def format_strategies(strategies: list[Strategy]) -> str:
     if not strategies:
         return "No strategies configured yet."
-    return "*Strategies*\n" + "\n".join(_s(s) for s in strategies)
+    return "<b>Strategies</b>\n" + "\n".join(_s(s) for s in strategies)
 
 
 def format_summary(summaries, session) -> str:
     """Analytics summaries (M5); placeholder until service lands."""
     if not summaries:
         return "No analytics summaries yet.\n\nUse `/summary` again after a few trades."
-    lines = ["*Analytics summaries*"]
+    lines = ["<b>Analytics summaries</b>"]
     for s in summaries:
         try:
             import json
@@ -175,8 +175,4 @@ def approval_keyboard(recommendation_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def escape(text: str) -> str:
-    """Escape Telegram Markdown special characters for plain text."""
-    for ch in ("_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"):
-        text = text.replace(ch, "\\" + ch)
-    return text
+

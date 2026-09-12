@@ -1,4 +1,4 @@
-"""Risk module: position sizing, exposure caps, cooldowns.
+"""Risk module: position sizing, exposure caps, cooldowns, trailing stops.
 
 Pure decision logic — no side effects. The execution engine calls these
 functions before persisting an intent. Any guard that fails causes the signal
@@ -45,6 +45,54 @@ class RiskManager:
         max_notional = balance * (self._cfg.max_position_pct / 100.0)
         qty = min(qty, max_notional / price)
         return max(qty, 0.0)
+
+    # --- trailing stops ---
+
+    def compute_trailing_stop_price(self, entry_price: float, current_price: float, is_long: bool = True) -> float | None:
+        """Calculate trailing stop price based on current price and trailing_stop_pct.
+
+        Returns the trailing stop price, or None if trailing stops are disabled.
+        """
+        if not self._cfg.trailing_stop_pct or self._cfg.trailing_stop_pct <= 0:
+            return None
+        pct = self._cfg.trailing_stop_pct / 100.0
+        if is_long:
+            # Trail below current price
+            return current_price * (1 - pct)
+        else:
+            # Trail above current price (for shorts)
+            return current_price * (1 + pct)
+
+    def check_trailing_stop(self, entry_price: float, current_price: float,
+                            existing_stop: float | None, is_long: bool = True) -> tuple[bool, float | None]:
+        """Check if trailing stop should be updated.
+
+        Returns (should_update, new_stop_price).
+
+        For long positions: track the highest price seen since entry.
+        For short positions: track the lowest price seen since entry.
+
+        Note: This stateless version computes the ideal stop based on current_price.
+        The engine must track the highest/lowest price separately for proper
+        trailing behavior. Here we return the stop based on current_price, but
+        the engine should only call this when price moves favorably.
+        """
+        if not self._cfg.trailing_stop_pct or self._cfg.trailing_stop_pct <= 0:
+            return False, None
+
+        new_stop = self.compute_trailing_stop_price(entry_price, current_price, is_long)
+        if new_stop is None:
+            return False, None
+
+        # Only update if the new stop is better (higher for long, lower for short)
+        if is_long:
+            if existing_stop is None or new_stop > existing_stop:
+                return True, new_stop
+        else:
+            if existing_stop is None or new_stop < existing_stop:
+                return True, new_stop
+
+        return False, None
 
     # --- guards ---
 

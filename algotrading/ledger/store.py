@@ -62,6 +62,23 @@ class Ledger:
         intent.status = "skipped"
         self.record_event(intent.id, "risk_skipped", {"reason": reason})
 
+    def mark_trailing_stop_adjusted(self, symbol: str, new_stop_price: float) -> None:
+        """Record a trailing stop adjustment event (for audit trail)."""
+        # Find the latest fill intent for this symbol to attach the event
+        from algotrading.db.models import TradeIntent
+        intent = self._session.execute(
+            select(TradeIntent)
+            .where(TradeIntent.symbol == symbol, TradeIntent.side == "buy", TradeIntent.status == "filled")
+            .order_by(TradeIntent.ts.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if intent:
+            self.record_event(
+                intent.id,
+                "trailing_stop_adjusted",
+                {"symbol": symbol, "new_stop_price": new_stop_price},
+            )
+
     # --- derived state application (idempotent by intent status) ---
 
     def _apply_fill(self, intent: TradeIntent, fill_price: float, qty: float, fee: float) -> None:

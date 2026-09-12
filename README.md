@@ -80,8 +80,11 @@ reconcile → resume.
 `/help` · `/status` (mode, active strategy, positions, recent fills) ·
 `/start_bot` / `/stop_bot` (pause/resume the scheduler) · `/strategy`
 (versioned strategies) · `/risk` (current limits) · `/summary` (analytics) ·
-inline ✅/❌ buttons on AI proposals. Users outside the allowlist are silently
-ignored.
+inline ✅/❌ buttons on AI proposals. **Plain-text messages** (when `AI_API_KEY`
+is set) are answered by the LLM chat orchestrator, which can read bot state,
+research candles, run shadow backtests, and propose strategy changes — every
+change still requires your ✅ approval, and it never trades itself. Users
+outside the allowlist are silently ignored.
 
 ## Safety model (non-negotiable)
 
