@@ -31,7 +31,7 @@ risk:
   cooldown_seconds: 300
   max_daily_loss_pct: 3.0
   slippage_pct: 0.05
-  trailing_stop_pct: 0.0       # trailing stop as % of entry price (0 = disabled)
+  trailing_stop_pct: 2.0       # trailing stop as % of entry price (0 = disabled)
 
 schedule:
   market_tick_seconds: 60
@@ -65,7 +65,25 @@ log_json_fields:          # fields to include in JSON output (when log_format: j
 
 # --- Strategy ---
 strategy:
-  hot_reload: false       # auto-reload active strategy when settings.yaml/strategies.yaml change
+  hot_reload: true       # auto-reload active strategy when settings.yaml/strategies.yaml change
+
+# --- Modules (plug-and-play parts) ---
+# Every non-execution subsystem is a module selected by name. See
+# algotrading/modules/ and PROJECT_MAP.md for the full roster.
+#
+#   enabled: null       -> auto-select from mode/demo (recommended)
+#   enabled: [names]    -> use exactly these modules
+#   disabled: [names]   -> drop these from the selection (execution is locked)
+#   external: [paths]   -> import extra modules, e.g. "my_pkg.mod:MyModule"
+#   params: {name: {..}}-> constructor params for a module
+modules:
+  enabled: null
+  disabled: []
+  external: []
+  params: {}
+  strategy_plugin_paths:   # user/AI-authored strategy files live here
+    - strategies
+  autoload_strategies: true
 
 # --- Prometheus metrics (optional; requires prometheus-client) ---
 metrics:

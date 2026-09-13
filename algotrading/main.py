@@ -1,13 +1,17 @@
 """AlgoTrading entry point: async bootstrap wiring everything together.
 
-One process, one event loop:
+One process, one event loop. The trading core (scheduler + market tick +
+strategy engine + deterministic execution + ledger) is fixed; everything around
+it — market provider, order gateway, control surface, API, analytics, and the
+strategy sources — is a **module** selected from ``config/settings.yaml``
+``modules:`` and composed by :class:`algotrading.modules.ModuleManager`.
 
-    scheduler (APScheduler) -> market tick -> strategy engine -> execution engine
-    telegram (python-telegram-bot, polling) -> control surface + AI approvals
-    api (FastAPI, optional) -> /health + /status for monitoring
+    modules.setup(ctx)          -> picks provider/gateway, loads strategy plugins
+    scheduler (APScheduler)     -> market tick -> strategy -> execution
+    modules.start(ctx)          -> telegram polling, optional API server
 
-Startup order (per plan): restore DB + rebuild derived state from events +
-initial reconcile + safe resume. Live mode refuses to start without keys.
+Startup order: restore DB + rebuild derived state from events + initial
+reconcile + resume. Live mode refuses to start without credentials.
 
 Run with:  python -m algotrading.main [--demo-data] [--no-telegram]
 """
@@ -15,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import html
 import logging
 import signal
 import sys
@@ -26,14 +29,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from algotrading.config import Settings, get_secret, load_settings, validate_settings  # noqa: E402
+from algotrading.config import Settings, load_settings, validate_settings  # noqa: E402
 from algotrading.db import get_session, get_session_factory, init_db  # noqa: E402
 from algotrading.db.seed import ensure_seeded  # noqa: E402
-from algotrading.execution import LiveGateway, PaperGateway  # noqa: E402
 from algotrading.ledger import Ledger  # noqa: E402
 from algotrading.logging_config import setup_logging  # noqa: E402
-from algotrading.market.binance_provider import BinanceMarketProvider  # noqa: E402
-from algotrading.market.demo import DemoProvider  # noqa: E402
+from algotrading.modules import (  # noqa: E402
+    CAPABILITY_SCHEDULER_CONTROL,
+    ModuleError,
+    ModuleManager,
+)
 from algotrading.scheduler import BotContext, build_scheduler  # noqa: E402
 from algotrading.supervisor.health import HealthMonitor, ensure_wake_lock  # noqa: E402
 from algotrading.supervisor.reconcile import reconcile_and_report  # noqa: E402
@@ -60,47 +65,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 # --- components --------------------------------------------------------------
 
-def build_context(settings: Settings, demo: bool) -> BotContext:
-    """Assemble provider + gateway + session factory + health monitor.
+def build_context(
+    settings: Settings,
+    demo: bool,
+    disabled: tuple[str, ...] = (),
+) -> tuple[BotContext, ModuleManager]:
+    """Compose the bot from the configured modules.
 
-    Raises SystemExit in live mode when Binance keys are missing — the bot
-    refuses to start live without credentials (paper mode needs none).
+    Returns the scheduler context (with provider/gateway installed) and the
+    manager, so the caller can drive start/stop. Raises ModuleError if a locked
+    module (execution) fails or a required capability is missing.
     """
     session_factory = get_session_factory(settings.db_path)
     health = HealthMonitor(str(Path(settings.data_dir) / "heartbeat"))
+    ctx = BotContext(settings=settings, session_factory=session_factory, health=health)
 
+    manager = ModuleManager(settings, demo=demo, disabled=disabled)
+    manager.setup(ctx)
+
+    if ctx.provider is None or ctx.gateway is None:
+        raise ModuleError(
+            "market and execution modules must both be enabled "
+            f"(got: {manager.describe()})"
+        )
+    # Modules contribute scheduled jobs; the scheduler merges them at build time.
+    ctx.extra_jobs = manager.collect_jobs(ctx)
     if demo:
         log.warning("--demo-data: using synthetic candles; forcing paper mode")
-        provider = DemoProvider()
-        gateway = PaperGateway(provider, slippage_pct=settings.risk.slippage_pct)
-    elif settings.mode == "paper":
-        provider = BinanceMarketProvider()
-        gateway = PaperGateway(provider, slippage_pct=settings.risk.slippage_pct)
-    else:  # live
-        key = get_secret("binance_api_key")
-        secret = get_secret("binance_api_secret")
-        if not key or not secret:
-            log.error(
-                "LIVE mode requires BINANCE_API_KEY and BINANCE_API_SECRET in .env. "
-                "Refusing to start."
-            )
-            raise SystemExit(1)
-        log.warning(
-            "LIVE MODE — the bot will place REAL orders on Binance Spot. "
-            "This mode must only be enabled after explicit review."
-        )
-        from algotrading.market.binance_rest import BinanceRestClient
-
-        provider = BinanceMarketProvider()
-        gateway = LiveGateway(BinanceRestClient(api_key=key, api_secret=secret))
-
-    return BotContext(
-        settings=settings,
-        provider=provider,
-        gateway=gateway,
-        session_factory=session_factory,
-        health=health,
-    )
+    return ctx, manager
 
 
 class AppController:
@@ -121,34 +113,6 @@ class AppController:
         log.info("scheduler paused via Telegram")
 
 
-# --- Telegram push for AI proposals -----------------------------------------
-
-def _make_recommendation_pusher(app, allowed_users: list[int], loop: asyncio.AbstractEventLoop):
-    """Return a thread-safe callback that pushes a PENDING rec to Telegram."""
-    from algotrading.telegram.ui import approval_keyboard
-
-    async def _push(rec) -> None:
-        text = (
-            f"🤖 <b>AI proposal #{rec.id}</b> [{rec.kind}] for {rec.strategy_name}:\n"
-            f"{html.escape(rec.rationale or '(no rationale)')}"
-        )
-        for chat_id in allowed_users:
-            try:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="HTML",
-                    reply_markup=approval_keyboard(rec.id),
-                )
-            except Exception:  # noqa: BLE001 - alert failures must not crash the loop
-                log.exception("failed to push recommendation %s to chat %s", rec.id, chat_id)
-
-    def push(rec) -> None:
-        asyncio.run_coroutine_threadsafe(_push(rec), loop)
-
-    return push
-
-
 # --- app lifecycle -----------------------------------------------------------
 
 async def run(settings: Settings, demo: bool, no_telegram: bool) -> None:
@@ -158,12 +122,21 @@ async def run(settings: Settings, demo: bool, no_telegram: bool) -> None:
         ensure_seeded(session)
         Ledger(session).rebuild_positions()
 
-    ctx = build_context(settings, demo)
+    # --no-telegram forces the control module off without editing config.
+    disabled = ("control.telegram",) if no_telegram else ()
+    ctx, manager = build_context(settings, demo, disabled)
+    log.info(
+        "modules: %s",
+        ", ".join(f"{name}[{cap}]" for name, cap, _locked in manager.describe()),
+    )
     ctx.health.beat()
 
     # Startup reconcile: local intents vs exchange before any new orders.
     with get_session(settings.db_path) as session:
-        log.info("startup reconcile: %s", reconcile_and_report(session, ctx.gateway, settings.market.symbols))
+        log.info(
+            "startup reconcile: %s",
+            reconcile_and_report(session, ctx.gateway, settings.market.symbols),
+        )
 
     scheduler = build_scheduler(ctx)
     scheduler.start()
@@ -175,56 +148,15 @@ async def run(settings: Settings, demo: bool, no_telegram: bool) -> None:
         settings.schedule.market_tick_seconds,
     )
 
-    tg_app = None
-    controller = AppController(scheduler)
-    loop = asyncio.get_running_loop()
+    # The control surface reads the scheduler controller from the capability bag.
+    ctx.provide(CAPABILITY_SCHEDULER_CONTROL, AppController(scheduler))
 
-    # 2. Telegram control surface (skip when disabled).
-    if not no_telegram and get_secret("telegram_token"):
-        from algotrading.telegram.bot import build_application
+    # 2. Start modules (Telegram polling, optional API server, ...).
+    await manager.start(ctx)
 
-        tg_app = build_application(
-            settings,
-            get_session_factory(settings.db_path),
-            controller=controller,
-        )
-        ctx.on_recommendation = _make_recommendation_pusher(
-            tg_app, settings.telegram_allowed_users, loop
-        )
-        await tg_app.initialize()
-        await tg_app.updater.start_polling()
-        await tg_app.start()
-        log.info("telegram bot started (polling)")
-    elif no_telegram:
-        log.info("running without Telegram (--no-telegram)")
-    else:
-        log.warning("TELEGRAM_BOT_TOKEN missing; running without control surface")
-
-    # 3. Optional internal API.
-    api_task: asyncio.Task | None = None
-    if settings.api.enabled:
-        token = get_secret("api_token")
-        if not token:
-            log.error("api.enabled is true but API_TOKEN is not set in .env; API not started")
-        else:
-            import uvicorn
-
-            from algotrading.api import build_api
-
-            api_app = build_api(settings, get_session_factory(settings.db_path), ctx.health, token=token)
-            server = uvicorn.Server(
-                uvicorn.Config(
-                    api_app,
-                    host=settings.api.host,
-                    port=settings.api.port,
-                    log_level="warning",
-                )
-            )
-            api_task = asyncio.create_task(server.serve())
-            log.info("internal API on http://%s:%s", settings.api.host, settings.api.port)
-
-    # 4. Wait for shutdown signal, then tear down cleanly.
+    # 3. Wait for shutdown signal, then tear down cleanly.
     stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop_event.set)
@@ -238,21 +170,10 @@ async def run(settings: Settings, demo: bool, no_telegram: bool) -> None:
 
     log.info("shutting down…")
     # wait=True: let an in-flight job (e.g. a slow market_tick) finish before
-    # teardown, so the process actually exits after "bye" instead of lingering
-    # on the scheduler's worker threads (which confused the watchdog/restarts).
+    # teardown, so the process actually exits instead of lingering on the
+    # scheduler's worker threads (which confused the watchdog/restarts).
     scheduler.shutdown(wait=True)
-
-    if api_task is not None:
-        api_task.cancel()
-        try:
-            await api_task
-        except asyncio.CancelledError:
-            pass
-
-    if tg_app is not None:
-        await tg_app.updater.stop()
-        await tg_app.stop()
-        await tg_app.shutdown()
+    await manager.stop(ctx)
     log.info("bye")
 
 
@@ -274,6 +195,9 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(run(settings, demo=args.demo_data, no_telegram=args.no_telegram))
     except KeyboardInterrupt:
         pass
+    except ModuleError as exc:
+        log.error("fatal module configuration error: %s", exc)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

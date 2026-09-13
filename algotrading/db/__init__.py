@@ -5,6 +5,7 @@ schema_version migration hook lives here (see SCHEMA_VERSION).
 """
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
 
@@ -13,9 +14,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from algotrading.db.models import Base, Meta
 
+log = logging.getLogger(__name__)
+
 # Bump when you change models and need a migration. Simple, versioned migrations
 # can be added to apply() as the schema evolves.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @lru_cache(maxsize=1)
@@ -24,7 +27,7 @@ def get_engine(db_path: str = "data/algotrading.db"):
     # check_same_thread=False: async single-loop usage shares connections across tasks.
     engine = create_engine(
         f"sqlite:///{db_path}",
-        connect_args={"check_same_thread": False},
+        connect_args={"check_same_thread": False, "timeout": 30},
         future=True,
     )
 
@@ -34,6 +37,7 @@ def get_engine(db_path: str = "data/algotrading.db"):
         cur.execute("PRAGMA journal_mode=WAL")
         cur.execute("PRAGMA foreign_keys=ON")
         cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA busy_timeout = 10000")  # 10s wait
         cur.close()
 
     return engine
@@ -46,14 +50,40 @@ def get_session_factory(db_path: str = "data/algotrading.db"):
 
 
 def init_db(db_path: str = "data/algotrading.db") -> None:
-    """Create tables if missing and set schema_version."""
+    """Create tables if missing, run migrations, and set schema_version."""
     engine = get_engine(db_path)
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         row = session.get(Meta, "schema_version")
+        current_version = int(row.value) if row else 0
+        
+        # Run migrations if needed
+        if current_version < SCHEMA_VERSION:
+            _run_migrations(session, current_version, SCHEMA_VERSION)
+        
         if row is None:
             session.add(Meta(key="schema_version", value=str(SCHEMA_VERSION)))
-            session.commit()
+        else:
+            row.value = str(SCHEMA_VERSION)
+        session.commit()
+
+
+def _run_migrations(session: Session, from_version: int, to_version: int) -> None:
+    """Apply schema migrations incrementally."""
+    from sqlalchemy import text
+    
+    if from_version < 2 <= to_version:
+        # Migration v1 -> v2: Add trailing_stop_price and highest_price to positions table
+        # Check if columns already exist (for fresh databases created by create_all)
+        cols = session.execute(text("PRAGMA table_info(positions)")).fetchall()
+        col_names = {c[1] for c in cols}  # c[1] is column name
+        
+        if "trailing_stop_price" not in col_names:
+            session.execute(text("ALTER TABLE positions ADD COLUMN trailing_stop_price FLOAT"))
+        if "highest_price" not in col_names:
+            session.execute(text("ALTER TABLE positions ADD COLUMN highest_price FLOAT"))
+        session.commit()
+        log.info("Applied migration v1 -> v2: added trailing_stop_price and highest_price to positions table")
 
 
 def get_schema_version(db_path: str = "data/algotrading.db") -> int:

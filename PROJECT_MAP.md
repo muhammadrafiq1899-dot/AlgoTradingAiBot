@@ -22,13 +22,21 @@
 AI-assisted **spot-trading bot** for Binance that runs on Android/Termux and is
 controlled from Telegram. Modular monolith, one Python process, one asyncio event loop.
 
+- **Plug-and-play modules:** every non-execution subsystem (market data, strategy
+  sources, analytics, control surface, API) is a module selected from
+  `config/settings.yaml` `modules:` and composed by `algotrading/modules/`. Adding,
+  replacing, or disabling one is a config change — see §5.
+- **Execution is a locked module:** the order gateway can only be a built-in module
+  and cannot be disabled or replaced by config/external code (deterministic order path).
+- **Strategies are files:** user/AI-authored strategies live in `strategies/*.py`,
+  are AST-validated on load, and go live only after human approval.
 - **Execution is deterministic Python; AI is advisory only** (proposals need human approval).
 - **Modes:** `paper` (simulated fills vs live prices, no keys) / `live` (real orders, requires keys).
 - **Data:** SQLite (WAL), event-sourced trade lifecycle (`order_events` is the source of truth).
 - **Stack constraints (Termux/Android):** no ccxt (pulls Rust `cryptography`), no `openai` SDK
   (pulls Rust `jiter`), pydantic **v1** only, pure-Python indicators (no numpy/pandas).
 - Version: `algotrading/__init__.py` → `__version__ = "0.1.0"`.
-- Tests: `pytest tests/` (~60+, all M0–M7 milestones).
+- Tests: `pytest tests/` (173 passing, all M0–M7 milestones; includes a full non-technical-user scenario in `tests/test_scenario_end_to_end.py`).
 
 ## 2. How to run
 
@@ -50,11 +58,14 @@ fails with `No module named algotrading/main` and creates stray `bot.log`-style 
 ```
 AlgoTrading/
 ├── algotrading/              # the whole application (package)
-│   ├── main.py               # entry point: wires scheduler + telegram + API in one loop
+│   ├── main.py               # entry point: composes modules + scheduler, no hard-coded wiring
 │   ├── config.py             # pydantic Settings from config/*.yaml + .env secrets
 │   ├── cli_setup.py          # .env read/write, setup wizard, algobot start/stop/status/logs
+│   ├── modules/              # plug-and-play module framework (base/registry/manager)
+│   │   └── builtin/          # shipped modules: market, gateway, strategy, analytics, telegram, api
 │   ├── market/               # price data: providers + candle store
 │   ├── strategy/             # pure strategies, indicators, signal evaluation engine
+│   │                         #   + validation.py (code safety) + plugins.py (strategy files)
 │   ├── execution/            # risk checks, trade intents, order gateways (paper/live)
 │   ├── ledger/               # event-sourced trade lifecycle (fills → positions/trades)
 │   ├── db/                   # SQLAlchemy models, engine/session, seeding
@@ -70,6 +81,7 @@ AlgoTrading/
 ├── scripts/                  # setup_termux.sh, run_bot.sh, init_db.py, setup.py, algobot,
 │                             #   check_project_map.sh (map freshness), install_hooks.sh
 ├── config/                   # settings.yaml (everything tunable), strategies.yaml (schemas)
+├── strategies/               # user/AI-authored strategy plugins (.py), hot-reloaded
 ├── tests/                    # pytest suite, one file per subsystem
 ├── data/                     # runtime: algotrading.db, heartbeat, algobot.pid (gitignored)
 └── logs/                     # algotrading.log (rotating, gitignored)
@@ -77,12 +89,27 @@ AlgoTrading/
 
 ## 4. Data flow (read this before touching anything)
 
+**Composition (`algotrading/modules/manager.py`):** `main.py` builds the
+`BotContext` + `ModuleManager`, then `ModuleManager.setup` runs each enabled
+module in capability order (market → execution → strategy → analytics → control
+→ api), installing `ctx.provider` / `ctx.gateway` and capability keys into
+`ctx.services`. Modules contribute scheduled jobs via `Module.jobs(ctx)`, merged
+into `build_scheduler` as `ctx.extra_jobs`; async control surfaces start after
+the scheduler. `--no-telegram` disables `control.telegram`; `--demo-data`
+selects `market.demo` + `gateway.paper`.
+
+**Stock plugin loading (`strategy.plugins` module):** the loader scans
+`modules.strategy_plugin_paths` (`strategies/*.py`), AST-validates each file, and
+registers classes into the strategy registry alongside the built-ins. A periodic
+job (`strategy_plugins_reload`) picks up hand-edits without a restart.
+
 **Main loop (every `market_tick_seconds`, default 60s):**
 
 ```
 scheduler.market_tick (algotrading/scheduler/jobs.py)
   → market.BinanceMarketProvider|DemoProvider.fetch_klines  (algotrading/market/)
   → CandleStore.upsert → DB table `candles`
+  → protective exits first: execution.update_trailing_stops (+ execute the sell signals)
   → stale-data freeze check (max_staleness_seconds)
   → strategy.StrategyEngine.evaluate(snapshot)   → DB table `signals` (candidate|skipped)
   → execution.ExecutionEngine.execute(signal_id)
@@ -93,10 +120,12 @@ scheduler.market_tick (algotrading/scheduler/jobs.py)
       → positions/trades derived views updated incrementally
 ```
 
-**Other scheduled jobs** (`scheduler/jobs.py` + `config/settings.yaml` `schedule:`):
+**Core scheduled jobs** (`scheduler/jobs.py`, always on): `market_tick`,
+`reconcile` (15m local intents vs exchange open orders), `heartbeat` (60s touch
+of `data/heartbeat`). **Module-contributed jobs** (from `Module.jobs(ctx)`):
 `analytics` (30m metrics snapshot), `analytics_daily` (UTC midnight), `ai_review`
-(daily advisory LLM proposal → PENDING recommendation), `reconcile` (15m local
-intents vs exchange open orders), `heartbeat` (60s touch of `data/heartbeat`).
+(daily advisory LLM proposal → PENDING recommendation) from the analytics module,
+and `strategy_plugins_reload` from the strategy module.
 
 **Control surfaces (do NOT drive the pipeline):** Telegram commands (`/status`,
 `/strategy`, `/risk`, `/summary`, `/start_bot`, `/stop_bot`, inline ✅/❌ approval),
@@ -116,8 +145,17 @@ Telegram bot runs in the event loop with one session.
 
 | Path | Purpose | Key symbols |
 |---|---|---|
-| `algotrading/main.py` | Entry point, wiring, lifecycle | `parse_args`, `build_context`, `AppController`, `run`, `main` (shutdown waits for in-flight scheduler jobs) |
-| `algotrading/config.py` | YAML + .env → validated settings | `Settings`, `RiskConfig`, `MarketConfig`, `ScheduleConfig`, `AIConfig`, `ApiConfig`, `LogConfig`, `load_settings` (cached), `validate_settings`, `get_secret`, `load_strategy_definitions` |
+| `algotrading/main.py` | Entry point, module composition, lifecycle | `parse_args`, `build_context` → `(BotContext, ModuleManager)`, `AppController`, `run`, `main` (shutdown waits for in-flight scheduler jobs) |
+| `algotrading/config.py` | YAML + .env → validated settings | `Settings`, `RiskConfig`, `MarketConfig`, `ScheduleConfig`, `AIConfig`, `ApiConfig`, `LogConfig`, `ModulesConfig`, `load_settings` (cached), `validate_settings`, `get_secret`, `load_strategy_definitions` |
+| `algotrading/modules/base.py` | Module contract, capabilities, execution lock | `Module`, `ModuleSpec`, `ServiceBag`, `CAPABILITY_MARKET/EXECUTION/STRATEGY/ANALYTICS/CONTROL/API/SCHEDULER_CONTROL`, `LOCKED_CAPABILITIES`, `BUILD_ORDER`, `sort_modules`, `ModuleError` |
+| `algotrading/modules/registry.py` | Name → class + config-driven resolution | `register_module`, `get_module`, `all_modules`, `module_names`, `load_external_modules`, `default_enabled_names`, `resolve_modules`, `ModuleSpec` |
+| `algotrading/modules/manager.py` | Module lifecycle (setup/start/stop) + job collection | `ModuleManager` (`resolve`, `setup`, `start`, `stop`, `collect_jobs`, `describe`), `build_manager` |
+| `algotrading/modules/builtin/market_provider.py` | `market` capability (config-selectable) | `BinanceMarketModule` (`market.binance`), `DemoMarketModule` (`market.demo`) |
+| `algotrading/modules/builtin/execution_gateway.py` | `execution` capability — **LOCKED** | `PaperGatewayModule` (`gateway.paper`), `LiveGatewayModule` (`gateway.live`, keys required) |
+| `algotrading/modules/builtin/strategy_source.py` | `strategy` capability + plugin reload job | `StrategyPluginModule` (`strategy.plugins`), `reload_strategy_plugins`, `RELOAD_JOB_ID` |
+| `algotrading/modules/builtin/analytics_jobs.py` | `analytics` capability + metrics/AI jobs | `AnalyticsModule` (`analytics.default`) |
+| `algotrading/modules/builtin/telegram_control.py` | `control` capability (async start/stop) | `TelegramControlModule` (`control.telegram`), `make_recommendation_pusher` |
+| `algotrading/modules/builtin/http_api.py` | `api` capability (optional) | `HttpApiModule` (`api.http`) |
 | `algotrading/logging_config.py` | Structured JSON/text logging + correlation IDs | `setup_logging`, `JSONFormatter`, `TextFormatter`, `get_correlation_id`, `set_correlation_id` |
 | `algotrading/db/models.py` | ORM tables (event-sourced core) | `Base`, `Strategy`, `Signal`, `TradeIntent`, `OrderEvent`, `Position`, `Trade`, `Candle`, `AnalyticsSummary`, `AIRecommendation`, `Meta` |
 | `algotrading/db/__init__.py` | Engine, WAL pragmas, sessions | `get_engine`, `get_session_factory`, `init_db`, `get_schema_version`, `get_session`, `SCHEMA_VERSION` |
@@ -129,13 +167,16 @@ Telegram bot runs in the event loop with one session.
 | `algotrading/market/demo.py` | Deterministic synthetic feed | `DemoProvider` |
 | `algotrading/market/candles.py` | Persist/query candles, backfill | `CandleStore` (upsert/get/latest_ts/prune), `backfill` |
 | `algotrading/strategy/base.py` | Strategy protocol + signal model | `Signal`, `Strategy` (stateless, pure) |
-| `algotrading/strategy/indicators.py` | Pure-Python TA (no numpy) | `sma`, `ema`, `rsi`, `atr`, `bollinger_bands`, `macd`, `supertrend`, `vwap`, `closes/highs/lows`, `last_valid` |
+| `algotrading/strategy/indicators.py` | Pure-Python TA (no numpy) + indicator registry | `sma`, `ema`, `rsi`, `atr`, `bollinger_bands`, `macd`, `supertrend`, `vwap`, `closes/highs/lows`, `last_valid`, `register_indicator`, `create_indicator` |
+| `algotrading/strategy/validation.py` | One safety gate for AI/user-authored code | `validate_strategy_code`, `validate_indicator_code`, `compile_strategy`, `compile_indicator`, `safe_namespace`, `CodeValidationError` |
+| `algotrading/strategy/plugins.py` | Load/write/hot-reload strategy files on disk | `StrategyPluginLoader`, `StrategyPlugin`, `StrategyPluginError`, `get_default_loader`, `configure_default_loader`, `DEFAULT_PLUGIN_DIR` |
 | `algotrading/strategy/starters.py` | The built-in strategies (8 total) | `EMACrossover`, `RSIMeanReversion`, `BBMeanReversion`, `MACDTrend`, `SuperTrendStrategy`, `VWAPReclaim`, `MultiTFEMA`, `EnsembleStrategy`, `STRATEGIES` registry dict |
-| `algotrading/strategy/registry.py` | Name → class lookup + param validation | `build_strategy`, `known_names`, `UnknownStrategyError` |
+| `algotrading/strategy/registry.py` | Name → class lookup (built-ins + plugins) | `build_strategy`, `known_names`, `builtin_names`, `plugin_names`, `is_builtin`, `is_plugin`, `reload_plugins`, `UnknownStrategyError` |
+| `algotrading/strategy/catalog.py` | Live strategy catalog (schemas + ranges) for prompts/UI | `catalog_entries`, `default_params`, `StrategyEntry`, `ParamSpec` (`range_text`, `compact`), `BUILTIN`/`PLUGIN` |
 | `algotrading/strategy/engine.py` | Evaluate snapshot → persisted signals with optional hot-reload | `StrategyEngine` (`evaluate`, `get_active_strategy`, `_maybe_reload_strategy`, duplicate guard) |
 | `algotrading/execution/base.py` | Gateway protocol + result type | `ExchangeGateway`, `OrderResult` |
 | `algotrading/execution/risk.py` | Sizing + guards + trailing stops, pure logic | `RiskManager` (`check_buy`, `check_sell`, `size_position`, `compute_trailing_stop_price`, `check_trailing_stop`), `RiskDecision` |
-| `algotrading/execution/engine.py` | Signal → intent → order → event + trailing stops | `ExecutionEngine.execute` (intent-before-order, idempotency key), `update_trailing_stops`, `_init_trailing_stop` |
+| `algotrading/execution/engine.py` | Signal → intent → order → event + trailing stops | `ExecutionEngine.execute` (intent-before-order, idempotency key), `update_trailing_stops` (returns protective sell signals the caller must execute; `highest_price` may be NULL, so it falls back to entry price), `_init_trailing_stop` |
 | `algotrading/execution/paper_gateway.py` | Simulated fills w/ slippage + 0.1% fee | `PaperGateway` |
 | `algotrading/execution/live_gateway.py` | Real Binance market orders | `LiveGateway` (status `unknown` on ambiguous failure) |
 | `algotrading/ledger/store.py` | Event-sourced lifecycle + rebuild | `Ledger` (`mark_filled/mark_sent/mark_failed/mark_risk_skipped`, `rebuild_positions`) |
@@ -144,19 +185,20 @@ Telegram bot runs in the event loop with one session.
 | `algotrading/ai/client.py` | OpenAI-compatible chat client (requests) | `AIClient.complete_json`, `extract_json`, `RecommendationError` |
 | `algotrading/ai/prompt_builder.py` | Deterministic prompt from local data | `build_prompt`, `build_feature_window` |
 | `algotrading/ai/assistant.py` | LLM → validated PENDING recommendation | `Assistant.propose`, `_validate` |
-| `algotrading/store/recommendations.py` | Recommendation CRUD + human apply + pending creation | `RecommendationStore` (`pending`, `mark_rejected`, `apply`), `create_pending_recommendation`, `ALLOWED_KINDS` / `ALLOWED_STRATEGY_NAMES` |
-| `algotrading/store/strategy_versions.py` | Controlled single-active release | `latest_version`, `create_new_version`, `promote_to_active` |
-| `algotrading/telegram/bot.py` | PTB Application bootstrap + factories | `build_application`, approve/reject callbacks |
-| `algotrading/telegram/commands.py` | Command handlers + allowlist auth + rate limiting + chat handler wiring | `build_handlers`, `_auth_decorator`, `_rate_limited`, `_check_rate_limit` |
-| `algotrading/telegram/chat.py` | LLM orchestrator (plain-text chat): tool-using agent | `run_agent`, `tool_get_status/get_market/backtest/propose_change`, `CHAT_SYSTEM_PROMPT` |
-| `algotrading/telegram/ui.py` | Formatting + inline keyboards | `format_status/risk/strategies/summary`, `approval_keyboard` |
+| `algotrading/store/recommendations.py` | Recommendation CRUD + human apply + pending creation | `RecommendationStore` (`pending`, `mark_rejected`, `apply`, `_shadow_backtest`), `create_pending_recommendation`, `allowed_strategy_names`, `ALLOWED_KINDS` (incl. `new_strategy` / `edit_strategy` / `new_indicator`); `apply` authors `new_strategy`/`edit_strategy` code *before* the shadow backtest (the name doesn't resolve otherwise) and skips it for `new_indicator` (a function, not a strategy) |
+| `algotrading/store/strategy_versions.py` | Controlled single-active release + strategy file writes | `latest_version`, `create_new_version`, `create_new_strategy`, `update_strategy_code`, `promote_to_active` |
+| `algotrading/telegram/bot.py` | PTB Application bootstrap + factories | `build_application`, `_make_approve`, `_make_reject`, `_make_backtest` (current vs default comparison, via `_current_params`), `_make_catalog_scores` (ranked scores, cached, threaded), `_stored_candles`, `run_bot` |
+| `algotrading/telegram/commands.py` | Command handlers + allowlist auth + rate limiting + chat handler wiring | `build_handlers` (`on_start/on_stop/on_approve/on_reject/on_backtest/on_catalog_scores`), `_auth_decorator`, `_rate_limited`, `reset_rate_limits`, `on_callback` (`approve:`/`reject:`/`bt:`); commands: `/help`, `/status`, `/strategies` (ranked catalog + backtest buttons), `/strategy`, `/risk`, `/summary`, `/start_bot`, `/stop_bot` |
+| `algotrading/telegram/chat.py` | LLM orchestrator (plain-text chat): tool-using agent | `run_agent`, `tool_get_status/get_market/backtest/propose_change`, `CHAT_SYSTEM_PROMPT`, `strategy_catalog` (delegates to `strategy/catalog.py`), `build_system_prompt` |
+| `algotrading/telegram/ui.py` | Formatting + inline keyboards | `format_status/risk/strategies/summary` (`format_risk` shows the trailing-stop setting), `format_strategy_catalog` (HTML, truncated to Telegram's cap; optional score/rank labels), `rank_by_score` (best-first, unscored last), `format_backtest_comparison` (side-by-side `<pre>` tables + risk-adjusted verdict), `_risk_adjusted` = PnL ÷ max drawdown, `approval_keyboard`, `backtest_keyboard` (`bt:<name>`, 64-byte-safe, capped) |
 | `algotrading/api/app.py` | FastAPI factory with enriched health + metrics | `build_api` (`/health`, `/metrics`, `/status`) |
 | `algotrading/api/metrics.py` | Prometheus metrics (optional) | `init_metrics`, `get_metrics`, `record_tick`, `record_signal`, `record_order`, `record_fill`, `tick_timer`, `market_timer`, `execution_timer` |
 | `algotrading/api/auth.py` | Bearer guard (constant-time) | `require_token` |
-| `algotrading/scheduler/jobs.py` | All periodic jobs + context | `BotContext`, `market_tick`, `analytics_tick`, `analytics_daily`, `ai_review`, `reconcile_tick`, `heartbeat_tick`, `build_scheduler` |
+| `algotrading/scheduler/jobs.py` | Core periodic jobs + context + module job merge | `BotContext` (with `provide`/`get`/`has`, `services`, `extra_jobs`), `JobSpec`, `market_tick` (runs `_run_trailing_stops` **before** the stale-data gate, so protective exits never depend on fresh entries), `_run_trailing_stops`, `analytics_tick`, `analytics_daily`, `ai_review`, `reconcile_tick`, `heartbeat_tick`, `build_scheduler` |
 | `algotrading/supervisor/health.py` | Heartbeat file + wake-lock | `HealthMonitor`, `ensure_wake_lock` |
 | `algotrading/supervisor/reconcile.py` | Intents vs exchange drift check | `reconcile`, `reconcile_and_report` |
 | `algotrading/backtest/runner.py` | Replay candles through a strategy | `run_backtest`, `BacktestResult`, `BacktestTrade` |
+| `algotrading/backtest/stored.py` | Load stored candles for a backtest (shared DB adapter) | `load_candles` → `(symbol, interval, candles)`, `resolve_market`, `DEFAULT_LIMIT` |
 | `algotrading/cli_setup.py` | .env + wizard + `algobot` subcommands | `read_env/write_env`, `prompt_for_fields`, `start/stop/status/show_logs/menu/run_setup` |
 | `scripts/setup_termux.sh` | Full Termux bootstrap (installs `algobot`) | — |
 | `scripts/run_bot.sh` | Supervisor loop: restart + heartbeat watchdog (300s grace period before it can kill; single-instance lock via `data/run_bot.lock`); auto SQLite backup before each start (`data/backups/`, 7-day retention) | — |
@@ -186,7 +228,14 @@ Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (bump + add mig
 
 | Task | Start here |
 |---|---|
-| Add a new strategy | `strategy/starters.py` (class + register in `STRATEGIES`) → `config/strategies.yaml` (schema) → `store/recommendations.py` `ALLOWED_STRATEGY_NAMES` → tests: `test_indicators.py`, `test_backtest.py` |
+| Add / replace a bot part (module) | `algotrading/modules/builtin/` — new `Module` subclass with a `ModuleSpec` + `@register_module`; import it in `builtin/__init__.py`; select it via `config/settings.yaml` `modules:`; tests: `test_modules.py` |
+| Choose which parts run | `config/settings.yaml` `modules.enabled/disabled/params` (execution is locked: cannot be disabled or externalised) |
+| Run headless (no Telegram) | `--no-telegram`, or `modules.disabled: [control.telegram]` |
+| Load a third-party module | `modules.external: ["pkg.mod:MyModule"]` (locked capabilities are refused) |
+| Add a new strategy (built-in) | `strategy/starters.py` (class + register in `STRATEGIES`) → `config/strategies.yaml` (schema) → tests: `test_indicators.py`, `test_backtest.py` |
+| Add a strategy as a file (user/AI) | `strategies/<name>.py` (convention in `strategies/README.md`); validated by `strategy/validation.py`, loaded by `strategy/plugins.py` |
+| Let the AI create / edit a strategy | `new_strategy` / `edit_strategy` recommendation kinds → human ✅ → `store/strategy_versions.py` writes the plugin file + a new version |
+| Change what code safety allows | `strategy/validation.py` (single gate for AI/user code; used by plugins, recommendations, indicators) |
 | **Built-in strategies** (ready to use) | `ema_crossover`, `rsi_mean_reversion`, `bb_mean_reversion`, `macd_trend`, `supertrend`, `vwap_reclaim`, `multi_tf_ema`, `ensemble` |
 | Add a new indicator | `strategy/indicators.py` (pure lists, oldest→newest, NaN padding) |
 | Change risk limits / sizing | `execution/risk.py` + `config/settings.yaml` `risk:` block |
@@ -202,6 +251,10 @@ Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (bump + add mig
 | Add a Binance endpoint | `market/binance_rest.py` (public vs signed helpers) |
 | Change fill/order behavior | `execution/paper_gateway.py` / `live_gateway.py` (keep the `ExchangeGateway` protocol) |
 | Tune the AI prompt | `ai/prompt_builder.py` (deterministic — same inputs ⇒ same prompt) |
+| Change which strategies the chat model knows about | `strategy/catalog.py` `catalog_entries()` builds it from `config/strategies.yaml` + plugin metadata, so AI-created plugins appear automatically; `config.py` `StrategyParam.type` accepts int/float/bool/str/list |
+| Show the available strategies / param ranges in Telegram | `/strategies` → `strategy/catalog.py` `catalog_entries()` → `telegram/ui.py` `format_strategy_catalog()` |
+| Rank strategies by risk-adjusted score | `/strategies` → `telegram/bot.py` `_make_catalog_scores` (backtests each strategy with its current params, threaded + 60s cached) → `telegram/ui.py` `rank_by_score` |
+| Backtest a strategy from Telegram | `/strategies` inline `bt:<name>` buttons → `telegram/commands.py` `on_callback` → `telegram/bot.py` `_make_backtest` (`_current_params` vs `strategy/catalog.py` `default_params`, replayed via `backtest/stored.py` + `runner.run_backtest`, formatted by `telegram/ui.py` `format_backtest_comparison`; the verdict scores PnL ÷ max drawdown, not raw PnL) |
 | Change log format (text/JSON) | `config/settings.yaml` `log:` block → `logging_config.py` handles formatting |
 | Config validation on startup | `config.py` `validate_settings()` → called in `main.py` before `build_context` |
 | Automated SQLite backup | `scripts/run_bot.sh` → creates `data/backups/algotrading-YYYY-MM-DD-HHMMSS.db` before each start, 7-day retention |
@@ -211,7 +264,8 @@ Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (bump + add mig
 | Telegram command rate limiting | `telegram/commands.py` `_rate_limited` decorator (10 req/60s per user, in-memory sliding window) |
 | Strategy param hot-reload | `strategy/engine.py` `_maybe_reload_strategy()` + `config/settings.yaml` `strategy.hot_reload` (gated, off by default) |
 | Prometheus /metrics endpoint | `api/metrics.py` + `api/app.py` `/metrics` (optional, gated by `metrics.enabled`, requires prometheus-client) |
-| Trailing stop support | `execution/risk.py` + `execution/engine.py` + `config/settings.yaml` `risk.trailing_stop_pct` (optional, gated, off by default) |
+| Trailing stop support | `execution/risk.py` + `execution/engine.py` + `config/settings.yaml` `risk.trailing_stop_pct` (optional, gated); `scheduler/jobs.py` `_run_trailing_stops` runs it every tick before the stale gate and executes the returned protective sells |
+| Verify the whole product as a user | `tests/test_scenario_end_to_end.py` — the end-to-end journey (setup → trade → every command → AI approval → API → restart) |
 | Ensemble/filter strategies | `strategy/starters.py` `EnsembleStrategy` + `config/strategies.yaml` `ensemble` + `store/recommendations.py` `ensemble_strategy`/`filter_strategy` kinds (consensus/any/filter/weighted modes) |
 
 ## 8. Debugging guide
@@ -233,6 +287,7 @@ with correlation IDs (request/trace tracking). JSON fields configurable via
 | "no candles fetched" each tick | provider failing; check `market/binance_rest.py` network errors, demo mode off |
 | "data stale; freezing new entries" | candle ts older than interval + `max_staleness_seconds`; time/clock drift or provider stalled — freeze is intentional |
 | signal exists but never executes | status `skipped` + `risk_skipped` event (`RiskManager` guard: cooldown, max positions, no position to close) |
+| trailing stop never moves / never exits | must run **before** the stale gate in `market_tick` (`_run_trailing_stops`) and its returned sell signals must be executed; a `highest_price` of NULL means no tick has run since entry (fall back to entry price) |
 | "duplicate signal" (`[dup]` rationale) | `StrategyEngine._skip_duplicate` — already holding the symbol, buy skipped |
 | order status `unknown` | `LiveGateway` ambiguous network/fill failure — reconcile job must confirm; never blindly retry |
 | "reconcile drift" | local intent has no matching exchange order (matched by `idempotency_key`); check `supervisor/reconcile.py` |
@@ -260,10 +315,15 @@ deterministic fix.
 | `test_analytics.py` | metric math + summary persistence |
 | `test_ai.py` | AI client parsing + prompt determinism |
 | `test_m6c.py` | recommendation store + apply, assistant validation, versioned release |
-| `test_telegram.py` | allowlist auth, /status formatting, approval flow |
+| `test_telegram.py` | allowlist auth, /status formatting, approval flow, /strategies catalog (built-ins + plugins, truncation, risk-adjusted ranking) and its `bt:` backtest buttons (current-vs-default comparison, verdict) |
+| `test_chat.py` | LLM chat orchestrator: tools (backtest/propose_change), safety contract |
 | `test_api.py` | /health open, /status bearer-guarded |
 | `test_live_gateway.py` | live gateway + supervisor units |
 | `test_backtest.py` | shadow backtest replay + equity summary |
+| `test_ema_percentage_strategy.py` | EMA + percentage-threshold strategy signals |
+| `test_modules.py` | module resolution, external loading, lifecycle, job contribution, execution lock |
+| `test_strategy_plugins.py` | plugin load/write/edit, code-safety rejection, hot-reload, AI authoring flow |
+| `test_scenario_end_to_end.py` | **Full non-technical-user scenario**: setup wizard, module composition, a real entry + trailing-stop exit (regression: protective exits run with no candidates, NULL `highest_price`, `CandleStore.latest` never existed), every Telegram command + backtest button + approve/reject, chat-driven `new_strategy` approval, analytics, API, restart rebuild |
 
 ## 10. Keeping this map in sync (git hook / CI)
 
@@ -299,3 +359,4 @@ deterministic fix.
 6. **Live requires keys + explicit mode;** bot refuses to start otherwise.
 7. **Thread-safety:** each job/thread opens its own DB session.
 8. **Termux compatibility:** keep deps dependency-light (no ccxt/openai-sdk/numpy/pandas; pydantic v1; pure-Python math).
+9. **Execution is locked:** the `execution` capability may only be provided by built-in modules, and `modules.disabled`/`modules.enabled` cannot remove or replace it. All AI/user-authored code (strategies, indicators) goes through `strategy/validation.py` before it can run, and can never mutate `ctx.gateway` or the ledger.

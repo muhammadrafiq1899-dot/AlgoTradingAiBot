@@ -18,10 +18,12 @@ from algotrading.ai.client import AIClient, RecommendationError, extract_json
 from algotrading.ai.prompt_builder import build_prompt
 from algotrading.db.models import AIRecommendation
 from algotrading.market.base import Candle
+from algotrading.strategy.registry import is_plugin
+from algotrading.strategy.validation import CodeValidationError, validate_strategy_code
 from algotrading.store.recommendations import (
     ALLOWED_KINDS,
-    ALLOWED_STRATEGY_NAMES,
     PENDING,
+    allowed_strategy_names,
 )
 
 log = logging.getLogger(__name__)
@@ -36,6 +38,16 @@ class Assistant:
         self._strategy_name = strategy_name
         self._params = params or {}
 
+    def _validate_ast(self, code: str) -> None:
+        """Validate generated strategy code using the shared safety gate.
+
+        Raises RecommendationError if the code is unsafe or malformed.
+        """
+        try:
+            validate_strategy_code(code)
+        except CodeValidationError as exc:
+            raise RecommendationError(str(exc)) from exc
+
     def _validate(self, data: dict[str, Any]) -> dict[str, Any]:
         """Validate + normalize the LLM's JSON into a recommendation payload.
 
@@ -47,7 +59,7 @@ class Assistant:
             raise RecommendationError(f"unknown kind {kind!r}")
 
         name = data.get("strategy_name") or self._strategy_name
-        
+
         content = data.get("content") or {}
         if not isinstance(content, dict):
             raise RecommendationError("content must be a JSON object")
@@ -66,20 +78,60 @@ class Assistant:
             for comp in components:
                 if not isinstance(comp, dict) or "name" not in comp:
                     raise RecommendationError("each component must have 'name' and 'params'")
-                if comp["name"] not in ALLOWED_STRATEGY_NAMES - {"ensemble"}:
+                if comp["name"] not in allowed_strategy_names() - {"ensemble"}:
                     raise RecommendationError(f"unknown component strategy: {comp['name']}")
+        elif kind == "new_strategy":
+            template = content.get("template", "")
+            if not template or not isinstance(template, str):
+                raise RecommendationError("new_strategy requires 'template' string with Python code")
+            self._validate_ast(template)
+            if name in allowed_strategy_names():
+                raise RecommendationError(
+                    f"strategy {name!r} already exists; use edit_strategy"
+                )
+
+            indicator_deps = content.get("indicator_deps", [])
+            if indicator_deps and not isinstance(indicator_deps, list):
+                raise RecommendationError("indicator_deps must be a list of indicator function names")
+
+            param_names = [p["name"] for p in content.get("param_schema", [])] if content.get("param_schema") else []
+            if param_names:
+                for param in param_names:
+                    placeholder = f"{{{{{param}}}}}"
+                    if placeholder not in template:
+                        log.warning("Parameter %s placeholder not found in template", param)
+        elif kind == "edit_strategy":
+            if not is_plugin(name):
+                raise RecommendationError(
+                    f"edit_strategy requires an existing plugin strategy; {name!r} is not editable this way"
+                )
+            template = content.get("template", "")
+            if not template or not isinstance(template, str):
+                raise RecommendationError("edit_strategy requires 'template' string with Python code")
+            self._validate_ast(template)
         else:
-            if name not in ALLOWED_STRATEGY_NAMES:
+            if name not in allowed_strategy_names():
                 raise RecommendationError(f"unknown strategy_name {name!r}")
 
         # For a plain hypothesis there is no params change.
+        content_json_data = {
+            "params": params,
+            "position_pct": content.get("position_pct"),
+        }
+
+        # Include extended fields for new/edited strategies
+        if kind in ("new_strategy", "edit_strategy"):
+            content_json_data.update({
+                "template": content.get("template", ""),
+                "indicator_deps": content.get("indicator_deps", []),
+                "param_schema": content.get("param_schema", []),
+                "test_template": content.get("test_template", ""),
+            })
+
         return {
             "kind": kind,
             "strategy_name": name,
-            "content_json": json.dumps({
-                "params": params,
-                "position_pct": content.get("position_pct"),
-            }),
+            "content_json": json.dumps(content_json_data),
             "rationale": data.get("rationale", "") or "",
         }
 
@@ -120,6 +172,6 @@ class Assistant:
         )
         self._session.add(rec)
         self._session.commit()
-        log.info("AI proposed %s for %s (id=%s)", payload["kind"],
-                 payload["strategy_name"], rec.id)
+
+        log.info("Created AI recommendation %s (%s)", rec.id, rec.kind)
         return rec

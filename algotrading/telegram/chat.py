@@ -36,6 +36,7 @@ from algotrading.db.models import (
     TradeIntent,
 )
 from algotrading.market.candles import CandleStore
+from algotrading.strategy.catalog import catalog_entries
 from algotrading.store.recommendations import create_pending_recommendation
 
 log = logging.getLogger(__name__)
@@ -47,18 +48,68 @@ CHAT_SYSTEM_PROMPT = """You are the conversational control layer of AlgoTrading,
 You have these tools (call ONE per turn):
 - get_status: current bot state. No args.
 - get_market: recent candles for research. Args: {"symbol": "BTC/USDT" (optional), "interval": "1h"|"1m" (optional)}.
-- backtest: replay historical candles through a strategy. Args: {"strategy_name": "...", "params": {...}}.
-- propose_change: create a strategy-change proposal the user must approve. Args: {"kind": "param_change"|"new_strategy"|"hypothesis"|"failure_analysis", "strategy_name": "...", "params": {...}, "rationale": "..."}.
+- backtest: replay historical candles through a strategy. Args: {"strategy_name": "...", "params": {...}, "symbol": "..." (optional), "interval": "..." (optional), "limit": 500 (optional)}.
+- propose_change: create a strategy-change proposal the user must approve. Args: {"kind": "param_change"|"new_strategy"|"edit_strategy"|"new_indicator"|"hypothesis"|"failure_analysis", "strategy_name": "...", "params": {...}, "rationale": "...", "template": "...(optional)", "indicator_deps": [...](optional), "param_schema": [...](optional), "test_template": "...(optional)"}.
 
-Known strategies and params:
-- ema_crossover: fast_period (int), slow_period (int, > fast), position_pct (float 0.01-0.5)
-- rsi_mean_reversion: period (int), oversold (float), overbought (float, > oversold), position_pct (float 0.01-0.5)
+Known strategies and params (built-ins plus any plugin strategies loaded from strategies/*.py):
+{{STRATEGY_CATALOG}}
+
+For new_strategy proposals:
+- strategy_name: a NEW name not already in use
+- template: Python code defining a strategy class with evaluate() method
+- indicator_deps: List of indicator functions required (e.g., ["sma", "ema", "rsi"])
+- param_schema: List of parameter definitions [{"name": "param1", "type": "int", "default": 10, "min": 1, "max": 100}, ...]
+- test_template: Python test code to validate the strategy
+
+For edit_strategy proposals:
+- strategy_name: an EXISTING AI-created strategy (built-ins are changed with param_change)
+- template: full replacement Python code for that strategy class
+- The previous version is retired when the edit is approved (single active version).
+
+For new_indicator proposals:
+- kind: Must be "new_indicator"
+- strategy_name: Name for the new indicator function
+- template: Python code defining the indicator function
+- params: Parameter schema for the indicator [{"name": "period", "type": "int", "default": 14, "min": $_2_, "max": $_100_}]
+- test_template: Python test code to validate the indicator
+- rationale: Explanation of what the indicator does and why it's useful
 
 HARD RULES:
 1. You are ADVISORY ONLY. You never trade, never change the active strategy, risk limits, or mode. The ONLY way to change anything is propose_change, which stays PENDING until the user taps Approve.
 2. Before proposing a param change, run a backtest and mention its result in your reply.
 3. Answer questions about the bot from get_status / get_market / backtest results. Be concise, plain text, no markdown, no emoji spam.
 4. Respond ONLY with a JSON object: {"action": "reply", "text": "..."} or {"action": "tool", "name": "...", "args": {...}}."""
+
+
+def _summarise(description: str, limit: int = 110) -> str:
+    """Collapse a description to a single short line for the prompt."""
+    text = " ".join((description or "").split())
+    if not text:
+        return ""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def strategy_catalog() -> str:
+    """Render the 'known strategies' list from the live registry.
+
+    Delegates to :mod:`algotrading.strategy.catalog` (shared with the
+    ``/strategies`` command) and is recomputed per call, so an AI-created plugin
+    is visible to the next chat turn without a restart.
+    """
+    lines: list[str] = []
+    for entry in catalog_entries():
+        params = ", ".join(p.compact() for p in entry.params) or "no params"
+        summary = _summarise(entry.description)
+        lines.append(
+            f"- {entry.name} [{entry.kind}]: {params}"
+            + (f" — {summary}" if summary else "")
+        )
+    return "\n".join(lines) if lines else "(no strategies available)"
+
+
+def build_system_prompt() -> str:
+    """The chat system prompt with the live strategy catalog substituted in."""
+    return CHAT_SYSTEM_PROMPT.replace("{{STRATEGY_CATALOG}}", strategy_catalog())
 
 
 def _active_strategy(session) -> Strategy | None:
@@ -143,39 +194,54 @@ def tool_get_market(session, settings: Settings, symbol: str | None = None,
 
 
 def tool_backtest(session, settings: Settings, strategy_name: str,
-                  params: dict[str, Any]) -> str:
-    """Deterministic shadow backtest on stored candles; returns a summary."""
+                  params: dict[str, Any], symbol: str | None = None,
+                  interval: str | None = None, limit: int | None = None) -> str:
+    """Deterministic shadow backtest on stored candles; returns a summary.
+
+    Args:
+        strategy_name: registered strategy name (e.g. "ema_crossover")
+        params: strategy parameters
+        symbol: optional, defaults to first configured symbol
+        interval: optional, defaults to 1h if available else 1m
+        limit: optional, defaults to 500 candles
+    """
     from algotrading.backtest.runner import run_backtest
-    from algotrading.market.base import Candle
+    from algotrading.backtest.stored import DEFAULT_LIMIT, load_candles
 
     if not isinstance(params, dict):
         raise ValueError("params must be a JSON object")
-    sym = (settings.market.symbols or ["BTC/USDT"])[0]
-    iv = "1h" if "1h" in settings.market.intervals else "1m"
-    rows = CandleStore(session).get(sym, iv, limit=500)
-    candles = [
-        Candle(symbol=r.symbol, interval=r.interval, ts=r.ts, open=r.open,
-               high=r.high, low=r.low, close=r.close, volume=r.volume)
-        for r in rows
-    ]
+    lim = limit if limit is not None else DEFAULT_LIMIT
+    sym, iv, candles = load_candles(session, settings, symbol, interval, lim)
     if not candles:
-        return "no candles stored — cannot backtest yet"
+        return f"no candles stored for {sym} {iv} — cannot backtest yet"
     result = run_backtest(candles, strategy_name, dict(params))
     return (
-        f"Backtest {strategy_name} on {sym} {iv}: {result.n_trades} trades, "
-        f"win_rate={result.win_rate:.2%}, total_pnl={result.total_pnl:.2f}, "
-        f"max_drawdown={result.max_drawdown:.2f}, final_balance={result.final_balance:.2f}"
+        f"Backtest {strategy_name} on {sym} {iv} ({len(candles)} candles): "
+        f"{result.n_trades} trades, win_rate={result.win_rate:.2%}, "
+        f"total_pnl={result.total_pnl:.2f}, max_drawdown={result.max_drawdown:.2f}, "
+        f"final_balance={result.final_balance:.2f}"
     )
 
 
 def tool_propose_change(session, settings: Settings, **args: Any) -> dict[str, Any]:
     """Create a PENDING recommendation (never applies anything)."""
+    # Extract extended fields for new_strategy kind
+    template = args.get("template", "")
+    indicator_deps = args.get("indicator_deps", [])
+    param_schema = args.get("param_schema", [])
+    test_template = args.get("test_template", "")
+    
     rec = create_pending_recommendation(
         session,
         kind=args["kind"],
         strategy_name=args["strategy_name"],
         params=args["params"],
         rationale=args.get("rationale", ""),
+        position_pct=args.get("position_pct"),
+        template=template,
+        indicator_deps=indicator_deps,
+        param_schema=param_schema,
+        test_template=test_template,
     )
     return {
         "proposal_id": rec.id,
@@ -216,7 +282,7 @@ def run_agent(session_factory: Callable[[], Any], settings: Settings, user_text:
         context = tool_get_status(session, settings)
         context_text = "Current bot state:\n" + json.dumps(context, default=str)
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt()},
             {"role": "user", "content": f"{context_text}\n\nUser message: {user_text}"},
         ]
         proposal: dict[str, Any] | None = None

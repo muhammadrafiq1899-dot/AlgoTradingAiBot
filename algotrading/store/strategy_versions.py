@@ -5,10 +5,16 @@ retires the current active one and marks the newcomer active. This is the
 "controlled release" seam the AI approval flow drives: an approved proposal is
 shadow-backtested, then `create_new_version` + `promote_to_active` swap the
 live strategy.
+
+Strategy *code* lives on disk as a plugin file (see
+:mod:`algotrading.strategy.plugins`); these rows own the version/status history
+and the parameter snapshot. Only routes into this module are the human-approved
+recommendation flow — the AI can propose, never apply.
 """
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,6 +22,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from algotrading.db.models import Strategy
+from algotrading.strategy.plugins import StrategyPluginError, get_default_loader
+from algotrading.strategy.validation import CodeValidationError
+
+log = logging.getLogger(__name__)
 
 
 def latest_version(session: Session, name: str) -> Strategy | None:
@@ -59,6 +69,83 @@ def create_new_version(
     session.add(row)
     session.commit()
     return row
+
+
+def create_new_strategy(
+    session: Session,
+    name: str,
+    template: str,
+    params: dict[str, Any],
+    param_schema: list[dict[str, Any]],
+    indicator_deps: list[str],
+    description: str = "",
+    test_template: str = "",
+) -> Strategy:
+    """Register a brand-new AI/authored strategy: validate → write file → version.
+
+    Refuses to shadow a built-in or an existing plugin. The plugin file is the
+    durable home of the code, so the strategy survives restarts and can be
+    hand-edited; the DB row carries version/status/params.
+    """
+    loader = get_default_loader()
+    try:
+        loader.write_strategy(
+            name,
+            template,
+            description=description,
+            params=param_schema or None,
+            indicator_deps=indicator_deps or None,
+            overwrite=False,
+        )
+    except (StrategyPluginError, CodeValidationError) as exc:
+        raise ValueError(f"cannot create strategy {name!r}: {exc}") from exc
+
+    log.info("created strategy plugin %r", name)
+    return create_new_version(session, name, params, description)
+
+
+def update_strategy_code(
+    session: Session,
+    name: str,
+    template: str,
+    params: dict[str, Any] | None = None,
+    description: str = "",
+    param_schema: list[dict[str, Any]] | None = None,
+    indicator_deps: list[str] | None = None,
+) -> Strategy:
+    """Edit the code of an existing plugin strategy, then cut a new version.
+
+    Built-in strategies cannot be redefined here — use a parameter change (or a
+    new strategy name) so shipped code isn't silently replaced.
+    """
+    loader = get_default_loader()
+    if loader.get_class(name) is None:
+        raise ValueError(
+            f"{name!r} is not an editable plugin strategy "
+            "(built-ins are changed via param_change)"
+        )
+    try:
+        loader.write_strategy(
+            name,
+            template,
+            description=description or (loader.info(name).description if loader.info(name) else ""),
+            params=param_schema if param_schema is not None else (
+                list(loader.info(name).params) if loader.info(name) else None
+            ),
+            indicator_deps=indicator_deps if indicator_deps is not None else (
+                list(loader.info(name).indicator_deps) if loader.info(name) else None
+            ),
+            overwrite=True,
+        )
+    except (StrategyPluginError, CodeValidationError) as exc:
+        raise ValueError(f"cannot update strategy {name!r}: {exc}") from exc
+
+    latest = latest_version(session, name)
+    effective_params = params if params is not None else (
+        json.loads(latest.params or "{}") if latest else {}
+    )
+    log.info("updated strategy plugin %r", name)
+    return create_new_version(session, name, effective_params, description or f"code update of {name}")
 
 
 def promote_to_active(session: Session, strategy: Strategy) -> Strategy:

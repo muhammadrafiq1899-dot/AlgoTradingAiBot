@@ -394,6 +394,89 @@ class MultiTFEMA:
         return None
 
 
+class EMAPercentageStrategy:
+    """EMA crossover with percentage-based entry/exit conditions.
+    
+    Uses 9/20 EMA crossover for trend direction, but adds percentage thresholds
+    to avoid whipsaws and filter weak signals.
+    
+    Entry conditions:
+    - Fast EMA must be above slow EMA (bullish crossover)
+    - Price must be within buy_pct% of the fast EMA (not too extended)
+    
+    Exit conditions:
+    - Fast EMA crosses below slow EMA (bearish crossover)
+    - OR price moves below exit_pct% threshold from entry
+    """
+    
+    name = "ema_percentage_strategy"
+    
+    def __init__(self, params: dict[str, Any]) -> None:
+        self.params = params
+        self.fast = int(params.get("fast_period", 9))
+        self.slow = int(params.get("slow_period", 20))
+        self.buy_pct = float(params.get("buy_pct", 1.0))  # % from EMA for entry
+        self.exit_pct = float(params.get("exit_pct", 2.0))  # % from entry for exit
+        self.position_pct = float(params.get("position_pct", 0.2))
+        
+        if self.fast >= self.slow:
+            raise ValueError("fast_period must be < slow_period")
+        if self.buy_pct <= 0 or self.exit_pct <= 0:
+            raise ValueError("buy_pct and exit_pct must be positive")
+    
+    def evaluate(self, symbol: str, candles: Sequence[Candle]) -> Signal | None:
+        if len(candles) < self.slow + 1:
+            return None
+        
+        c = [x.close for x in candles]
+        fast = ta.ema(c, self.fast)
+        slow = ta.ema(c, self.slow)
+        
+        # Get latest valid values
+        i = len(c) - 1
+        if i < 1:
+            return None
+        
+        fast_now, slow_now = fast[i], slow[i]
+        fast_prev, slow_prev = fast[i - 1], slow[i - 1]
+        
+        if fast_now is None or slow_now is None or fast_prev is None or slow_prev is None:
+            return None
+        
+        current_price = c[i]
+        fast_ema = fast_now
+        
+        # Check for bullish crossover (fast EMA crosses above slow EMA)
+        if fast_prev <= slow_prev and fast_now > slow_now:
+            # Price must be within buy_pct% of the fast EMA for entry
+            price_from_ema = abs(current_price - fast_ema) / fast_ema * 100
+            if price_from_ema <= self.buy_pct:
+                return Signal(
+                    strategy_id=0,
+                    symbol=symbol,
+                    side="buy",
+                    ref_price=current_price,
+                    rationale=f"EMA {self.fast}/{self.slow} bullish crossover, "
+                             f"price within {self.buy_pct}% of EMA ({price_from_ema:.2f}%)",
+                    risk={"position_pct": self.position_pct},
+                    params=dict(self.params),
+                )
+        
+        # Check for bearish crossover (fast EMA crosses below slow EMA)
+        if fast_prev >= slow_prev and fast_now < slow_now:
+            return Signal(
+                strategy_id=0,
+                symbol=symbol,
+                side="sell",
+                ref_price=current_price,
+                rationale=f"EMA {self.fast}/{self.slow} bearish crossover",
+                risk={"position_pct": self.position_pct},
+                params=dict(self.params),
+            )
+        
+        return None
+
+
 class EnsembleStrategy:
     """Combine multiple strategies with voting/filtering logic.
 
@@ -516,6 +599,23 @@ class EnsembleStrategy:
         return None
 
 
+def register_strategy(name: str, strategy_class: type) -> None:
+    """Register a new strategy class dynamically.
+    
+    This allows AI-generated strategies to be added to the registry at runtime.
+    The class must have a 'name' attribute and an 'evaluate' method.
+    """
+    if not hasattr(strategy_class, "name"):
+        strategy_class.name = name
+    elif strategy_class.name != name:
+        raise ValueError(f"Strategy class name '{strategy_class.name}' doesn't match registration name '{name}'")
+    
+    if not hasattr(strategy_class, "evaluate"):
+        raise ValueError("Strategy class must have 'evaluate' method")
+    
+    STRATEGIES[name] = strategy_class
+
+
 STRATEGIES: dict[str, type] = {
     EMACrossover.name: EMACrossover,
     RSIMeanReversion.name: RSIMeanReversion,
@@ -524,5 +624,6 @@ STRATEGIES: dict[str, type] = {
     SuperTrendStrategy.name: SuperTrendStrategy,
     VWAPReclaim.name: VWAPReclaim,
     MultiTFEMA.name: MultiTFEMA,
+    EMAPercentageStrategy.name: EMAPercentageStrategy,
     EnsembleStrategy.name: EnsembleStrategy,
 }

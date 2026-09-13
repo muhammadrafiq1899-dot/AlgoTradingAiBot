@@ -14,9 +14,15 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/heartbeat
+data/backups/
+data/run_bot.lock
 logs/*.log
 *.pid
 *.heartbeat
+
+# --- Editor/agent scratch backups (never commit these) ---
+*.backup
+*.tmp
 
 # --- IDE / OS ---
 .idea/

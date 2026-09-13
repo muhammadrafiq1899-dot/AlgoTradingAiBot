@@ -216,9 +216,20 @@ def is_running() -> bool:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    # Check if process is a zombie (state 'Z' in /proc/<pid>/stat)
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat = f.read()
+        # stat format: pid (comm) state ...
+        # state is the 3rd field
+        state = stat.split()[2]
+        if state == "Z":
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def start(args: list[str]) -> None:

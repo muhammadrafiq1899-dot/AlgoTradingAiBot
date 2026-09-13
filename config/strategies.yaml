@@ -4,6 +4,12 @@
 # the `strategies` DB table as versioned, approved params (seeded from here on
 # first init). The AI assistant proposes param diffs that must be approved
 # before a new version is activated.
+#
+# For AI-generated strategies, extended schema includes:
+#   - template: Python code template with placeholders
+#   - indicator_deps: List of required indicator functions  
+#   - validation: AST whitelist/blacklist rules
+#   - test_template: Unit test template for validation
 
 strategies:
   - name: ema_crossover
@@ -74,6 +80,19 @@ strategies:
       - {name: entry_interval, type: str, default: "15m"}
       - {name: entry_fast, type: int, default: 5, min: 2, max: 20}
       - {name: entry_slow, type: int, default: 13, min: 5, max: 50}
+      - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}
+
+  - name: ema_percentage_strategy
+    description: >-
+      EMA crossover with percentage-based entry/exit filters. Uses 9/20 EMA for trend direction
+      but adds percentage thresholds to avoid whipsaws and filter weak signals. Entry requires
+      price to be within buy_pct% of fast EMA; exit triggers on bearish crossover or price moving
+      exit_pct% from entry.
+    params:
+      - {name: fast_period, type: int, default: 9, min: 2, max: 50}
+      - {name: slow_period, type: int, default: 20, min: 5, max: 100}
+      - {name: buy_pct, type: float, default: 1.0, min: 0.1, max: 5.0}
+      - {name: exit_pct, type: float, default: 2.0, min: 0.5, max: 10.0}
       - {name: position_pct, type: float, default: 0.2, min: 0.01, max: 0.5}
 
   - name: ensemble

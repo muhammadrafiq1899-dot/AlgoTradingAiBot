@@ -6,6 +6,7 @@ own DB session so no session is ever shared across threads.
 """
 from algotrading.scheduler.jobs import (
     BotContext,
+    JobSpec,
     ai_review,
     analytics_daily,
     analytics_tick,
@@ -17,6 +18,7 @@ from algotrading.scheduler.jobs import (
 
 __all__ = [
     "BotContext",
+    "JobSpec",
     "ai_review",
     "analytics_daily",
     "analytics_tick",

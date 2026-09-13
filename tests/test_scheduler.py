@@ -98,10 +98,27 @@ def _with_gateway(ctx, candles):
     return ctx
 
 
-def test_build_scheduler_registers_all_jobs(ctx):
+def test_build_scheduler_registers_core_jobs(ctx):
+    """The trading/health loop is core and always scheduled."""
     sched = build_scheduler(ctx)
     ids = {j.id for j in sched.get_jobs()}
-    assert ids == {"market_tick", "analytics", "analytics_daily", "ai_review", "reconcile", "heartbeat"}
+    assert ids == {"market_tick", "reconcile", "heartbeat"}
+    for job in sched.get_jobs():
+        assert job.max_instances == 1
+        assert job.coalesce
+
+
+def test_build_scheduler_merges_module_jobs(ctx):
+    """Non-execution jobs (analytics, AI review) come from the analytics module."""
+    from algotrading.modules.builtin.analytics_jobs import AnalyticsModule
+
+    ctx.extra_jobs = AnalyticsModule().jobs(ctx)
+    sched = build_scheduler(ctx)
+    ids = {j.id for j in sched.get_jobs()}
+    assert ids == {
+        "market_tick", "reconcile", "heartbeat",
+        "analytics", "analytics_daily", "ai_review",
+    }
     for job in sched.get_jobs():
         assert job.max_instances == 1
         assert job.coalesce

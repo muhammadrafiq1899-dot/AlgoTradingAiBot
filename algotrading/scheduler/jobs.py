@@ -46,20 +46,58 @@ log = logging.getLogger(__name__)
 SNAPSHOT_LIMIT = 500
 
 
+@dataclass(frozen=True)
+class JobSpec:
+    """A scheduled job contributed by a module.
+
+    Modules return these from ``Module.jobs(ctx)`` so that turning a module off
+    removes its scheduled work too, without editing ``build_scheduler``.
+    """
+
+    job_id: str
+    func: Callable[["BotContext"], None]
+    trigger: str  # "interval" | "cron"
+    trigger_args: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class BotContext:
-    """Everything a job needs. Assembled once in main.py; jobs are stateless."""
+    """Everything a job needs. Assembled once in main.py; jobs are stateless.
+
+    ``provider``/``gateway`` are installed by the module manager (not
+    constructed here), and ``services`` holds the capability → implementation
+    mapping so jobs resolve collaborators instead of importing concrete types.
+    """
 
     settings: Settings
-    provider: MarketDataProvider
-    gateway: ExchangeGateway
     session_factory: Callable[[], Any]
     health: HealthMonitor
+    provider: MarketDataProvider | None = None
+    gateway: ExchangeGateway | None = None
+    # Capability → implementation (see algotrading.modules.base).
+    services: dict[str, Any] = field(default_factory=dict)
+    # Scheduled jobs contributed by enabled modules (merged by build_scheduler).
+    extra_jobs: list[JobSpec] = field(default_factory=list)
     # Optional callback fired after the AI review job saves a PENDING
     # recommendation (e.g. Telegram push with the approval keyboard).
     # Called from the scheduler thread; the app must make it thread-safe.
     on_recommendation: Callable[[AIRecommendation], None] | None = None
     _eval_interval: str = field(default="1h", init=False)
+
+    def provide(self, capability: str, service: Any) -> None:
+        """Register a capability implementation for other modules/jobs."""
+        self.services[capability] = service
+
+    def get(self, capability: str) -> Any:
+        if capability not in self.services:
+            raise KeyError(
+                f"capability {capability!r} is not available "
+                f"(provided: {sorted(self.services)})"
+            )
+        return self.services[capability]
+
+    def has(self, capability: str) -> bool:
+        return capability in self.services
 
     def primary_interval(self) -> str:
         """Interval used for strategy evaluation: '1h' if configured, else first."""
@@ -95,8 +133,15 @@ def market_tick(ctx: BotContext) -> None:
                     continue
                 fetched += store.upsert(candles)
         if fetched == 0:
-            log.warning("market tick: no candles fetched; nothing to do")
-            return
+            log.warning("market tick: no candles fetched; checking protective exits only")
+
+        execution = ExecutionEngine(
+            session, ctx.gateway, RiskManager(settings.risk), Ledger(session)
+        )
+
+        # Protective exits run FIRST and unconditionally: a trailing stop must
+        # still fire when entries are frozen (stale data) or no new signal fired.
+        _run_trailing_stops(ctx, store, eval_interval, execution)
 
         # Freeze new entries on stale data (only protective exits allowed).
         newest_ts = _newest_ts(ctx, store, eval_interval)
@@ -117,34 +162,49 @@ def market_tick(ctx: BotContext) -> None:
             return
 
         engine = StrategyEngine(session, ctx.settings)
-        candidates = engine.evaluate(snapshot)
-        if not candidates:
-            return
-        execution = ExecutionEngine(
-            session, ctx.gateway, RiskManager(settings.risk), Ledger(session)
-        )
-        for sig in candidates:
+        for sig in engine.evaluate(snapshot):
             try:
                 execution.execute(sig.id)
             except Exception:  # noqa: BLE001 - a failed order must not stop the tick
                 log.exception("market tick: execution failed for signal %s", sig.id)
-
-        # Update trailing stops (if enabled) after all fills
-        trailing_pct = settings.risk.trailing_stop_pct
-        if trailing_pct and trailing_pct > 0:
-            try:
-                # Get current prices from latest candles
-                current_prices = {}
-                for symbol in settings.market.symbols:
-                    latest = store.latest(symbol, eval_interval)
-                    if latest:
-                        current_prices[symbol] = latest.close
-                if current_prices:
-                    execution.update_trailing_stops(current_prices)
-            except Exception:  # noqa: BLE001
-                log.exception("market tick: trailing stop update failed")
     finally:
         session.close()
+
+
+def _run_trailing_stops(
+    ctx: BotContext,
+    store: CandleStore,
+    eval_interval: str,
+    execution: ExecutionEngine,
+) -> None:
+    """Advance trailing stops for open positions and execute protective exits.
+
+    Called on every tick *before* the stale-data gate, so a position can always
+    be closed by its stop even when new entries are frozen. The sell signals
+    returned by ``update_trailing_stops`` must be executed here — generating
+    them without executing means the stop never actually closes the position.
+    """
+    trailing_pct = ctx.settings.risk.trailing_stop_pct
+    if not trailing_pct or trailing_pct <= 0:
+        return
+    try:
+        current_prices: dict[str, float] = {}
+        for symbol in ctx.settings.market.symbols:
+            # Newest stored candle for this symbol/interval (CandleStore has no
+            # ``latest``; an earlier version called one that never existed, so
+            # trailing stops silently never ran).
+            rows = store.get(symbol, eval_interval, limit=1, ascending=False)
+            if rows:
+                current_prices[symbol] = rows[0].close
+        if not current_prices:
+            return
+        for sig in execution.update_trailing_stops(current_prices):
+            try:
+                execution.execute(sig.id)
+            except Exception:  # noqa: BLE001 - a failed exit must not stop the tick
+                log.exception("market tick: trailing-stop exit failed for signal %s", sig.id)
+    except Exception:  # noqa: BLE001
+        log.exception("market tick: trailing stop update failed")
 
 
 def _newest_ts(ctx: BotContext, store: CandleStore, interval: str) -> int | None:
@@ -295,10 +355,12 @@ def build_scheduler(ctx: BotContext) -> AsyncIOScheduler:
             **trigger_args,
         )
 
+    # Core trading/health loop: always on.
     _add("market_tick", market_tick, "interval", seconds=sched_cfg.market_tick_seconds)
-    _add("analytics", analytics_tick, "interval", minutes=sched_cfg.analytics_minutes)
-    _add("analytics_daily", analytics_daily, "cron", hour=sched_cfg.daily_analytics_hour)
-    _add("ai_review", ai_review, "cron", hour=sched_cfg.ai_review_hour)
     _add("reconcile", reconcile_tick, "interval", minutes=sched_cfg.reconcile_minutes)
     _add("heartbeat", heartbeat_tick, "interval", seconds=60)
+
+    # Module-contributed jobs (analytics, AI review, plugin reload, ...).
+    for spec in ctx.extra_jobs:
+        _add(spec.job_id, spec.func, spec.trigger, **spec.trigger_args)
     return sched

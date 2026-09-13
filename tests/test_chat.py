@@ -14,7 +14,34 @@ from algotrading.db import get_session_factory, init_db
 from algotrading.db.models import AIRecommendation, Strategy
 from algotrading.market.base import Candle
 from algotrading.market.candles import CandleStore
-from algotrading.telegram.chat import run_agent
+from algotrading.strategy.plugins import (
+    DEFAULT_PLUGIN_DIR,
+    configure_default_loader,
+    get_default_loader,
+)
+from algotrading.telegram.chat import build_system_prompt, run_agent, strategy_catalog
+
+# Minimal plugin used to prove the catalog is registry-driven, not hard-coded.
+PLUGIN_CODE = '''
+class MomentumNudge:
+    """Buy when the last close ticks up."""
+
+    def __init__(self, params=None):
+        self.params = params or {}
+        self.lookback = int(self.params.get("lookback", 3))
+
+    def evaluate(self, symbol, candles):
+        return None
+'''
+
+
+@pytest.fixture()
+def plugin_dir(tmp_path):
+    """Point the plugin loader at a temp dir, restoring it afterwards."""
+    directory = tmp_path / "strategies"
+    configure_default_loader([directory])
+    yield directory
+    configure_default_loader([DEFAULT_PLUGIN_DIR])
 
 
 class FakeClient:
@@ -137,3 +164,46 @@ def test_agent_llm_failure_is_friendly(session_factory):
     client = FakeClient([])  # complete_json raises immediately
     result = run_agent(session_factory, _settings(), "hi", client=client)
     assert "LLM call failed" in result["text"]
+
+
+# --- dynamic strategy catalog -------------------------------------------------
+
+def test_strategy_catalog_lists_builtin_schemas():
+    text = strategy_catalog()
+    assert "- ema_crossover [built-in]" in text
+    assert "fast_period (int, default 12, range 2-200)" in text
+    assert "- rsi_mean_reversion [built-in]" in text
+    # str/list params must render too (multi_tf_ema / ensemble).
+    assert "trend_interval (str, default '1h')" in text
+    assert "components (list)" in text
+
+
+def test_strategy_catalog_lists_plugins(plugin_dir):
+    get_default_loader().write_strategy(
+        "momentum_nudge",
+        PLUGIN_CODE,
+        description="Test plugin",
+        params=[{"name": "lookback", "type": "int", "default": 3, "min": 1, "max": 50}],
+    )
+    text = strategy_catalog()
+    assert "- momentum_nudge [plugin]" in text
+    assert "lookback (int, default 3, range 1-50)" in text
+    assert "Test plugin" in text
+
+
+def test_system_prompt_substitutes_catalog(plugin_dir):
+    get_default_loader().write_strategy("momentum_nudge", PLUGIN_CODE, params=[])
+    prompt = build_system_prompt()
+    assert "momentum_nudge" in prompt
+    assert "ema_crossover" in prompt
+    assert "{{STRATEGY_CATALOG}}" not in prompt
+
+
+def test_agent_sends_dynamic_catalog(session_factory, plugin_dir):
+    get_default_loader().write_strategy("momentum_nudge", PLUGIN_CODE, params=[])
+    client = FakeClient([{"action": "reply", "text": "ok"}])
+    run_agent(session_factory, _settings(), "hi", client=client)
+
+    system = client.calls[0][0]
+    assert system["role"] == "system"
+    assert "momentum_nudge" in system["content"]

@@ -87,6 +87,21 @@ class MetricsConfig(BaseModel):
     enabled: bool = False
 
 
+class ModulesConfig(BaseModel):
+    """Plug-and-play module selection (see algotrading/modules/).
+
+    ``enabled=None`` means "derive the set from mode/demo". ``params`` passes
+    per-module constructor arguments, keyed by module name.
+    """
+    enabled: list[str] | None = None
+    disabled: list[str] = Field(default_factory=list)
+    params: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    external: list[str] = Field(default_factory=list)
+    # Directories scanned for user/AI-authored strategy plugin files.
+    strategy_plugin_paths: list[str] = Field(default_factory=lambda: ["strategies"])
+    autoload_strategies: bool = True
+
+
 class Settings(BaseModel):
     mode: Literal["paper", "live"] = "paper"
     market: MarketConfig = Field(default_factory=MarketConfig)
@@ -97,6 +112,7 @@ class Settings(BaseModel):
     log: LogConfig = Field(default_factory=LogConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    modules: ModulesConfig = Field(default_factory=ModulesConfig)
     telegram_allowed_users: list[int] = Field(default_factory=list)
     data_dir: str = "data"
     log_dir: str = "logs"
@@ -124,6 +140,13 @@ def load_settings(
     settings.db_path = str(Path(settings.data_dir) / "algotrading.db")
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.log_dir).mkdir(parents=True, exist_ok=True)
+
+    # Strategy plugin dirs are relative to the project root, not the CWD, so the
+    # bot finds them regardless of where it was launched from (Termux gotcha).
+    settings.modules.strategy_plugin_paths = [
+        str(p if Path(p).is_absolute() else PROJECT_ROOT / p)
+        for p in settings.modules.strategy_plugin_paths
+    ]
 
     # Merge .env secrets
     if os.getenv("TELEGRAM_ALLOWED_USERS"):
@@ -184,23 +207,45 @@ def get_secret(name: str) -> str:
 
 class StrategyParam(BaseModel):
     name: str
-    type: Literal["int", "float", "bool"]
+    # YAML schemas use str (intervals, modes) and list (ensemble components) in
+    # addition to the numeric/bool types; all must parse for seeding + the
+    # dynamic strategy catalog the chat prompt is built from.
+    type: Literal["int", "float", "bool", "str", "list"]
     # Values use Any: YAML already yields native int/float/bool types, and
     # pydantic v1's `int | float` union would truncate 0.2 -> 0. Preserve them.
     default: Any
     min: Any = None
     max: Any = None
+    # Allowed values for enum-style params (e.g. ensemble `mode`).
+    enum: list[Any] | None = None
 
 
 class StrategyDef(BaseModel):
     name: str
     description: str = ""
     params: list[StrategyParam] = Field(default_factory=list)
+    # Extended fields for AI-generated strategies
+    template: str = ""  # Python code template with {{param_name}} placeholders
+    indicator_deps: list[str] = Field(default_factory=list)  # Required indicator functions
+    validation: dict[str, Any] = Field(default_factory=dict)  # AST whitelist/blacklist rules
+    test_template: str = ""  # Unit test template for validation
 
 
 def load_strategy_definitions(path: str | Path = DEFAULT_STRATEGIES) -> list[StrategyDef]:
     raw = _load_yaml(path)
-    return [StrategyDef.parse_obj(s) for s in raw.get("strategies", [])]
+    strategies = []
+    for s in raw.get("strategies", []):
+        # Ensure backward compatibility - add empty extended fields if not present
+        if "template" not in s:
+            s["template"] = ""
+        if "indicator_deps" not in s:
+            s["indicator_deps"] = []
+        if "validation" not in s:
+            s["validation"] = {}
+        if "test_template" not in s:
+            s["test_template"] = ""
+        strategies.append(StrategyDef.parse_obj(s))
+    return strategies
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -306,3 +351,29 @@ def validate_settings(settings: Settings) -> None:
         raise ValueError(
             "telegram_allowed_users set but TELEGRAM_BOT_TOKEN not configured"
         )
+
+    # Modules: names must exist, no duplicate capability, locked ones stay on.
+    # Imported lazily: algotrading.modules imports config at module load.
+    from algotrading.modules.registry import get_module, module_names
+
+    modules = settings.modules
+    for name in list(modules.enabled or []) + list(modules.disabled):
+        if get_module(name) is None:
+            raise ValueError(f"unknown module {name!r}; known: {module_names()}")
+    for name in modules.disabled:
+        if get_module(name).spec.locked:
+            raise ValueError(
+                f"module {name!r} provides a locked capability and cannot be disabled"
+            )
+    if modules.enabled is not None:
+        caps: dict[str, str] = {}
+        for name in modules.enabled:
+            capability = get_module(name).spec.capability
+            if capability in caps:
+                raise ValueError(
+                    f"modules {caps[capability]!r} and {name!r} both provide "
+                    f"capability {capability!r}"
+                )
+            caps[capability] = name
+    if not modules.strategy_plugin_paths:
+        raise ValueError("modules.strategy_plugin_paths must not be empty")

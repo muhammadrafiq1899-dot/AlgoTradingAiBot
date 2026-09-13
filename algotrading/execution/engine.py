@@ -162,8 +162,10 @@ class ExecutionEngine:
             entry_price = pos.avg_price or current_price
             existing_stop = getattr(pos, 'trailing_stop_price', None)
 
-            # Track highest price for trailing stop (only move up for longs)
-            highest_price = getattr(pos, 'highest_price', entry_price)
+            # Track highest price for trailing stop (only move up for longs).
+            # `highest_price` is nullable and unset until the first tick after
+            # entry, so fall back to the entry price instead of comparing to None.
+            highest_price = pos.highest_price or entry_price
             if current_price > highest_price:
                 highest_price = current_price
                 pos.highest_price = highest_price

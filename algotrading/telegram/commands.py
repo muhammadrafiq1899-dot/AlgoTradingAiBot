@@ -26,12 +26,16 @@ from telegram.ext import (
 )
 
 from algotrading.db.models import Position, Signal, Strategy, Trade, TradeIntent
+from algotrading.strategy.catalog import catalog_entries
 from algotrading.telegram.ui import (
     approval_keyboard,
+    backtest_keyboard,
     format_risk,
     format_status,
+    format_strategy_catalog,
     format_strategies,
     format_summary,
+    rank_by_score,
 )
 
 log = logging.getLogger(__name__)
@@ -46,6 +50,11 @@ RATE_LIMIT_MAX_COMMANDS = 10
 RATE_LIMIT_WINDOW_SEC = 60
 _rate_limit_store: dict[int, list[float]] = defaultdict(list)
 _rate_limit_lock = asyncio.Lock()
+
+
+def reset_rate_limits() -> None:
+    """Clear all rate-limit windows (operational escape hatch + test isolation)."""
+    _rate_limit_store.clear()
 
 
 async def _check_rate_limit(user_id: int) -> bool:
@@ -106,13 +115,18 @@ def build_handlers(
     on_stop=None,
     on_approve=None,
     on_reject=None,
+    on_backtest=None,
+    on_catalog_scores=None,
     allowed_users: Iterable[int] = (),
 ) -> list:
     """Return PTB handlers bound to DB + settings + control callbacks.
 
     `on_start`/`on_stop` are async callables(update, context) that perform the
     actual scheduler start/stop; `on_approve`/`on_reject` handle the inline
-    recommendation callbacks (M6). Passing None keeps the command as a stub.
+    recommendation callbacks (M6); `on_backtest(strategy_name, update, context)`
+    runs the /strategies backtest buttons; `on_catalog_scores()` returns
+    {strategy name: BacktestResult} used to rank the /strategies list. Passing
+    None keeps the command as a stub.
 
     Each handler gets its own session from session_factory() to avoid
     concurrent access issues and PendingRollbackError when the database is
@@ -139,6 +153,7 @@ def build_handlers(
             "/start_bot — start the scheduler\n"
             "/stop_bot — stop the scheduler\n"
             "/strategy — list strategy versions\n"
+            "/strategies — available strategies (tap one to backtest)\n"
             "/risk — current risk limits\n"
             "/summary — analytics summary (M5)\n"
             "/paper — switch to paper mode\n"
@@ -198,6 +213,26 @@ def build_handlers(
             )
         finally:
             sess.close()
+
+    # --- /strategies (live catalog: built-ins + plugins, with param ranges) ---
+    @auth
+    @_rate_limited
+    async def strategies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        entries = catalog_entries()
+        # Scores are optional: if scoring fails (or there are no candles yet) the
+        # catalog still renders, just unranked.
+        scores: dict = {}
+        if on_catalog_scores is not None:
+            try:
+                scores = await on_catalog_scores() or {}
+            except Exception:  # noqa: BLE001 - never break the command over scoring
+                log.exception("/strategies: scoring failed")
+        ranked = rank_by_score(entries, scores)
+        await update.effective_message.reply_text(
+            format_strategy_catalog(ranked, scores),
+            parse_mode=TEXT_MARKDOWN,
+            reply_markup=backtest_keyboard(ranked),
+        )
 
     # --- /risk ---
     @auth
@@ -263,23 +298,36 @@ def build_handlers(
                 card, parse_mode="HTML", reply_markup=approval_keyboard(result["proposal_id"])
             )
 
-    # --- inline approval callbacks (M6) ---
+    # --- inline callbacks: approval (M6) + backtest buttons ---
     @auth
     @_rate_limited
-    async def on_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
-        data = query.data  # "approve:12" | "reject:12"
-        action, _, rec_id = data.partition(":")
-        rec_id = int(rec_id)
-        handler = on_approve if action == "approve" else on_reject
-        if handler is None:
-            await query.edit_message_text(f"{action} not implemented yet.")
+        action, _, payload = (query.data or "").partition(":")
+
+        if action in ("approve", "reject"):
+            rec_id = int(payload)
+            handler = on_approve if action == "approve" else on_reject
+            if handler is None:
+                await query.edit_message_text(f"{action} not implemented yet.")
+                return
+            result = await handler(rec_id, update, context)
+            await query.edit_message_text(
+                f"Recommendation {rec_id} {action}d.\n{result or ''}", parse_mode=TEXT_MARKDOWN
+            )
             return
-        result = await handler(rec_id, update, context)
-        await query.edit_message_text(
-            f"Recommendation {rec_id} {action}d.\n{result or ''}", parse_mode=TEXT_MARKDOWN
-        )
+
+        if action == "bt":
+            if on_backtest is None:
+                await query.edit_message_text("Backtest not wired yet.")
+                return
+            result = await on_backtest(payload, update, context)
+            # Reply (don't edit) so the catalog + buttons stay usable for more taps.
+            await update.effective_message.reply_text(result, parse_mode=TEXT_MARKDOWN)
+            return
+
+        log.warning("ignoring unknown callback action %r", action)
 
     handlers = [
         CommandHandler("help", help_cmd),
@@ -287,9 +335,10 @@ def build_handlers(
         CommandHandler("start_bot", start_cmd),
         CommandHandler("stop_bot", stop_cmd),
         CommandHandler("strategy", strategy_cmd),
+        CommandHandler("strategies", strategies_cmd),
         CommandHandler("risk", risk_cmd),
         CommandHandler("summary", summary_cmd),
-        CallbackQueryHandler(on_approval, pattern=r"^(approve|reject):"),
+        CallbackQueryHandler(on_callback, pattern=r"^(approve|reject|bt):"),
     ]
     if session_factory is not None:
         handlers.append(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_cmd))

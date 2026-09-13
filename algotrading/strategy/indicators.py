@@ -12,11 +12,17 @@ Conventions:
 """
 from __future__ import annotations
 
+import inspect
 import math
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Dict, Iterable, Sequence, Tuple
+
+from algotrading.strategy.validation import CodeValidationError, compile_indicator
 
 Number = float
 NaN = math.nan
+
+# Registry for indicator functions with metadata
+_INDICATOR_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 
 def sma(values: Sequence[float], period: int) -> list[float]:
@@ -312,3 +318,160 @@ def vwap_anchored(highs: Sequence[float], lows: Sequence[float], closes: Sequenc
         if cum_vol > 0:
             out[i] = cum_pv / cum_vol
     return out
+
+
+# ----------------------------------------------------------------------------
+# Indicator registry and registration functions
+# ----------------------------------------------------------------------------
+
+def register_indicator(func: Callable, metadata: Dict[str, Any] | None = None) -> None:
+    """Register an indicator function in the global registry.
+    
+    Args:
+        func: The indicator function to register
+        metadata: Optional metadata about the indicator including:
+            - description: Human-readable description
+            - return_type: Type of return value (e.g., "list[float]", "tuple[list[float], list[float]]")
+            - param_schema: List of parameter definitions
+            - dependencies: List of other indicators this depends on
+    """
+    name = func.__name__
+    if name in _INDICATOR_REGISTRY:
+        raise ValueError(f"Indicator '{name}' is already registered")
+    
+    # Extract default metadata from function signature
+    sig = inspect.signature(func)
+    param_info = []
+    for param_name, param in sig.parameters.items():
+        param_info.append({
+            "name": param_name,
+            "type": str(param.annotation) if param.annotation != inspect.Parameter.empty else "Any",
+            "default": param.default if param.default != inspect.Parameter.empty else None,
+            "required": param.default == inspect.Parameter.empty,
+        })
+    
+    # Build metadata
+    meta = metadata or {}
+    meta.update({
+        "name": name,
+        "module": func.__module__,
+        "signature": str(sig),
+        "params": param_info,
+        "docstring": func.__doc__ or "",
+    })
+    
+    _INDICATOR_REGISTRY[name] = meta
+
+
+def get_indicator_metadata(name: str) -> Dict[str, Any]:
+    """Get metadata for a registered indicator."""
+    if name not in _INDICATOR_REGISTRY:
+        raise ValueError(f"Indicator '{name}' not found in registry")
+    return _INDICATOR_REGISTRY[name].copy()
+
+
+def list_indicators() -> list[str]:
+    """List all registered indicator names."""
+    return sorted(_INDICATOR_REGISTRY.keys())
+
+
+def create_indicator(
+    name: str,
+    code: str,
+    metadata: Dict[str, Any] | None = None,
+) -> Callable:
+    """Create and register a new indicator from Python code.
+    
+    Args:
+        name: Name for the new indicator
+        code: Python function definition code
+        metadata: Optional metadata about the indicator
+        
+    Returns:
+        The created indicator function
+        
+    Raises:
+        ValueError: If code is invalid or unsafe
+    """
+    # Shared safety gate: one validator for every piece of AI-authored code.
+    try:
+        indicator_func = compile_indicator(code, name)
+    except CodeValidationError as exc:
+        raise ValueError(str(exc)) from exc
+
+    # Register the function
+    register_indicator(indicator_func, metadata)
+    
+    # Also add to module namespace for backward compatibility
+    globals()[name] = indicator_func
+    
+    return indicator_func
+
+
+# Auto-register all built-in indicators on module load
+def _register_builtin_indicators():
+    """Register all built-in indicator functions."""
+    builtins = [
+        (sma, {
+            "description": "Simple Moving Average",
+            "return_type": "list[float]",
+        }),
+        (ema, {
+            "description": "Exponential Moving Average",
+            "return_type": "list[float]",
+        }),
+        (rsi, {
+            "description": "Relative Strength Index",
+            "return_type": "list[float]",
+        }),
+        (atr, {
+            "description": "Average True Range",
+            "return_type": "list[float]",
+        }),
+        (bollinger_bands, {
+            "description": "Bollinger Bands",
+            "return_type": "tuple[list[float], list[float], list[float]]",
+        }),
+        (macd, {
+            "description": "Moving Average Convergence Divergence",
+            "return_type": "tuple[list[float], list[float], list[float]]",
+        }),
+        (supertrend, {
+            "description": "SuperTrend indicator",
+            "return_type": "tuple[list[float], list[bool]]",
+        }),
+        (vwap, {
+            "description": "Volume Weighted Average Price",
+            "return_type": "list[float]",
+        }),
+        (vwap_anchored, {
+            "description": "Anchored VWAP",
+            "return_type": "list[float]",
+        }),
+        (closes, {
+            "description": "Extract close prices from candles",
+            "return_type": "list[float]",
+        }),
+        (highs, {
+            "description": "Extract high prices from candles",
+            "return_type": "list[float]",
+        }),
+        (lows, {
+            "description": "Extract low prices from candles",
+            "return_type": "list[float]",
+        }),
+        (last_valid, {
+            "description": "Find last non-NaN value in sequence",
+            "return_type": "float | None",
+        }),
+    ]
+    
+    for func, meta in builtins:
+        try:
+            register_indicator(func, meta)
+        except ValueError:
+            pass  # Already registered
+
+
+# Register built-in indicators
+_register_builtin_indicators()
