@@ -140,13 +140,14 @@ TELEGRAM_ALLOWED_USERS=123456789
 
 Optional extras:
 
-| Setting | What it does |
+|| Setting | What it does |
 |---|---|
-| `AI_API_KEY` | Enables the AI assistant. Leave blank to skip. |
-| `AI_BASE_URL` | The AI service address. Default is OpenAI. Change for other providers. |
-| `AI_MODEL` | Which AI model to use. Default `gpt-4o-mini`. |
-| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Only needed for live trading. |
-| `API_TOKEN` | Only if you enable the optional internal status web server. |
+|| `AI_API_KEY` | Enables the AI assistant via an external LLM (when `USE_HERMES=false`). Leave blank to skip. |
+|| `AI_BASE_URL` | The AI service address. Default is OpenAI. Change for other providers. |
+|| `AI_MODEL` | Which AI model to use. Default `gpt-4o-mini`. |
+|| `USE_HERMES` | Set to `true` to run the assistant on the local Hermes Agent instead of an external LLM (no API key needed). |
+|| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Only needed for live trading. |
+|| `API_TOKEN` | Only if you enable the optional internal status web server. |
 
 ### Step 5 — Start it
 
@@ -254,7 +255,16 @@ change came from the AI or from you.
 
 ## 8. Using the AI assistant
 
-Set `AI_API_KEY` and restart. That enables two things:
+Enable it one of two ways, then restart:
+
+- Set `AI_API_KEY` (plus optionally `AI_BASE_URL` / `AI_MODEL`) to use an
+  external OpenAI-compatible service, **or**
+- Set `USE_HERMES=true` to run the assistant through a locally installed
+  [Hermes Agent](https://hermes-agent.nousresearch.com/docs) — no API key, no
+  cloud service. The bot calls it with a terminal-free toolset, so the assistant
+  still can't touch anything by itself.
+
+That enables two things:
 
 1. **A daily review.** Once a day the assistant looks at your recent trades and
    analytics and, if it has an idea, sends you a proposal card on Telegram. You
@@ -350,7 +360,9 @@ something goes wrong:
 | What you see | What's probably happening | What to do |
 |---|---|---|
 | The bot never replies | Your Telegram ID isn't in the allowlist | Check `TELEGRAM_ALLOWED_USERS` in `.env` (get your ID from @userinfobot) |
-| "AI assistant is not configured" | No AI key | Set `AI_API_KEY` and restart |
+| "AI assistant is not configured" | Neither provider is switched on | Set `AI_API_KEY` **or** `USE_HERMES=true` in `.env`, then restart |
+| "USE_HERMES=true but the `hermes` command was not found" | Hermes Agent isn't on the bot's PATH | Install Hermes Agent (`hermes --version` in the same shell), or set `AI_API_KEY` instead |
+| "The LLM call failed: Hermes CLI returned no answer" | The local agent produced no parsable answer | Run `hermes chat -q 'hi'` in the same shell to check it works; raise `HERMES_TIMEOUT` in `.env` if it's just slow |
 | "No candles stored yet" | It hasn't collected prices yet | Wait a minute, or check the logs |
 | "data stale; freezing new entries" | The price feed stopped | Usually temporary; check your connection |
 | "no candles fetched" every minute | Can't reach Binance | Check internet / whether Binance is blocked in your region |

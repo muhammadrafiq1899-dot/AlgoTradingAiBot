@@ -274,7 +274,8 @@ def build_handlers(
         if not settings.ai.enabled:
             await update.effective_message.reply_text(
                 "🤖 AI assistant is not configured. Set AI_API_KEY "
-                "(+ AI_BASE_URL/AI_MODEL) in .env and restart."
+                "(+ AI_BASE_URL/AI_MODEL) in .env — or set USE_HERMES=true to "
+                "run it through the local Hermes Agent — and restart."
             )
             return
         from algotrading.telegram.chat import run_agent

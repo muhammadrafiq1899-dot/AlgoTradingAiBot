@@ -23,6 +23,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
+# Import Hermes client conditionally to avoid hard dependency
+try:
+    from algotrading.hermes_ai.client import HermesAgentClient
+    HERMES_AI_AVAILABLE = True
+except ImportError:
+    HERMES_AI_AVAILABLE = False
+    HermesAgentClient = None  # type: ignore
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from algotrading.analytics.service import AnalyticsService
@@ -301,9 +309,15 @@ def ai_review(ctx: BotContext) -> None:
 
         assistant = Assistant(
             session,
-            client=AIClient(config=ctx.settings.ai),
+            client=HermesAgentClient()
+            if (
+                getattr(ctx.settings.ai, 'use_hermes', False)
+                and HERMES_AI_AVAILABLE
+            )
+            else AIClient(config=ctx.settings.ai),
             strategy_name=active.name,
             params=params,
+            settings=ctx.settings,
         )
         rec = assistant.propose(symbol, interval, summaries, candles)
         if rec is not None and ctx.on_recommendation is not None:

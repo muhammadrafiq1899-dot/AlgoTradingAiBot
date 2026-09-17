@@ -2,12 +2,13 @@
 
 The assistant is the ONLY place that talks to the LLM. It builds a
 deterministic prompt from analytics summaries + recent candles, calls the
-AIClient, validates the structured JSON, and persists an AIRecommendation in
+LLM, validates the structured JSON, and persists an AIRecommendation in
 PENDING status. It NEVER applies anything and never touches the exchange.
 
 Failure of the LLM/network is non-fatal: the bot keeps running on the last
 approved strategy. A failed proposal simply isn't persisted.
 """
+
 from __future__ import annotations
 
 import json
@@ -26,17 +27,38 @@ from algotrading.store.recommendations import (
     allowed_strategy_names,
 )
 
+# Import Hermes client conditionally to avoid hard dependency
+try:
+    from algotrading.hermes_ai.client import HermesAgentClient
+    HERMES_AI_AVAILABLE = True
+except ImportError:
+    HERMES_AI_AVAILABLE = False
+    HermesAgentClient = None  # type: ignore
+
 log = logging.getLogger(__name__)
 
 
 class Assistant:
-    def __init__(self, session, client: AIClient | None = None,
-                 strategy_name: str = "ema_crossover",
-                 params: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        session,
+        client: Any | None = None,
+        strategy_name: str = "ema_crossover",
+        params: dict[str, Any] | None = None,
+        settings: Any = None,
+    ):
         self._session = session
-        self._client = client or AIClient()
         self._strategy_name = strategy_name
         self._params = params or {}
+        self._settings = settings
+        
+        # Choose client based on settings
+        if client is not None:
+            self._client = client
+        elif settings and getattr(settings.ai, 'use_hermes', False) and HERMES_AI_AVAILABLE:
+            self._client = HermesAgentClient()
+        else:
+            self._client = AIClient()
 
     def _validate_ast(self, code: str) -> None:
         """Validate generated strategy code using the shared safety gate.
@@ -92,14 +114,20 @@ class Assistant:
 
             indicator_deps = content.get("indicator_deps", [])
             if indicator_deps and not isinstance(indicator_deps, list):
-                raise RecommendationError("indicator_deps must be a list of indicator function names")
+                raise RecommendationError(
+                    "indicator_deps must be a list of indicator function names"
+                )
 
-            param_names = [p["name"] for p in content.get("param_schema", [])] if content.get("param_schema") else []
+            param_names = [
+                p["name"] for p in content.get("param_schema", [])
+            ] if content.get("param_schema") else []
             if param_names:
                 for param in param_names:
                     placeholder = f"{{{{{param}}}}}"
                     if placeholder not in template:
-                        log.warning("Parameter %s placeholder not found in template", param)
+                        log.warning(
+                            "Parameter %s placeholder not found in template", param
+                        )
         elif kind == "edit_strategy":
             if not is_plugin(name):
                 raise RecommendationError(
@@ -121,12 +149,14 @@ class Assistant:
 
         # Include extended fields for new/edited strategies
         if kind in ("new_strategy", "edit_strategy"):
-            content_json_data.update({
-                "template": content.get("template", ""),
-                "indicator_deps": content.get("indicator_deps", []),
-                "param_schema": content.get("param_schema", []),
-                "test_template": content.get("test_template", ""),
-            })
+            content_json_data.update(
+                {
+                    "template": content.get("template", ""),
+                    "indicator_deps": content.get("indicator_deps", []),
+                    "param_schema": content.get("param_schema", []),
+                    "test_template": content.get("test_template", ""),
+                }
+            )
 
         return {
             "kind": kind,
@@ -135,9 +165,14 @@ class Assistant:
             "rationale": data.get("rationale", "") or "",
         }
 
-    def propose(self, symbol: str, interval: str,
-                summaries: Sequence[Any], candles: Sequence[Candle],
-                max_feature_rows: int = 24) -> AIRecommendation | None:
+    def propose(
+        self,
+        symbol: str,
+        interval: str,
+        summaries: Sequence[Any],
+        candles: Sequence[Candle],
+        max_feature_rows: int = 24,
+    ) -> AIRecommendation | None:
         """Build the prompt, call the LLM, persist a PENDING recommendation.
 
         Returns the saved recommendation, or None if the LLM is disabled or
@@ -148,8 +183,7 @@ class Assistant:
             return None
 
         messages = build_prompt(
-            symbol, interval, summaries, candles,
-            self._strategy_name, self._params, max_feature_rows=max_feature_rows,
+            symbol, interval, summaries, candles, self._strategy_name, self._params, max_feature_rows=max_feature_rows
         )
         try:
             data = self._client.complete_json(messages)

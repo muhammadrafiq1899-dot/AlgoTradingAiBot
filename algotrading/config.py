@@ -52,6 +52,7 @@ class ScheduleConfig(BaseModel):
 
 class AIConfig(BaseModel):
     enabled: bool = False
+    use_hermes: bool = False  # Use Hermes Agent instead of external LLM
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4o-mini"
@@ -161,7 +162,12 @@ def load_settings(
     ai.api_key = os.getenv("AI_API_KEY", ai.api_key)
     ai.base_url = os.getenv("AI_BASE_URL", ai.base_url)
     ai.model = os.getenv("AI_MODEL", ai.model)
-    ai.enabled = bool(ai.api_key)
+    # Advisory LLM provider: external OpenAI-compatible API (AI_API_KEY) or the
+    # local Hermes Agent CLI (USE_HERMES=true). Either one enables the assistant.
+    ai.use_hermes = os.getenv("USE_HERMES", "false").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+    ai.enabled = bool(ai.api_key) or ai.use_hermes
 
     # Binance keys (needed for live only; paper ignores them)
     _secrets["binance_api_key"] = os.getenv("BINANCE_API_KEY", "")
@@ -317,8 +323,10 @@ def validate_settings(settings: Settings) -> None:
 
     # AI config
     if settings.ai.enabled:
-        if not settings.ai.api_key:
-            raise ValueError("ai.enabled=true requires ai.api_key (AI_API_KEY in .env)")
+        if not settings.ai.use_hermes and not settings.ai.api_key:
+            raise ValueError(
+                "ai.enabled=true and ai.use_hermes=false requires ai.api_key (AI_API_KEY in .env)"
+            )
         if settings.ai.temperature < 0 or settings.ai.temperature > 2:
             raise ValueError("ai.temperature must be in [0, 2]")
         if settings.ai.max_recommendations_per_review < 1:

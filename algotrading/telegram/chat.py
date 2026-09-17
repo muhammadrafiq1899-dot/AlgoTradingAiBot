@@ -23,6 +23,14 @@ import json
 import logging
 from typing import Any, Callable
 
+# Import Hermes client conditionally to avoid hard dependency
+try:
+    from algotrading.hermes_ai.client import HermesAgentClient
+    HERMES_AI_AVAILABLE = True
+except ImportError:
+    HERMES_AI_AVAILABLE = False
+    HermesAgentClient = None  # type: ignore
+
 from sqlalchemy import select
 
 from algotrading.ai.client import AIClient, RecommendationError
@@ -264,7 +272,7 @@ TOOLS: dict[str, Callable[..., Any]] = {
 # --- agent loop -------------------------------------------------------------
 
 def run_agent(session_factory: Callable[[], Any], settings: Settings, user_text: str,
-              client: AIClient | None = None, max_turns: int = MAX_TOOL_TURNS) -> dict[str, Any]:
+              client: Any | None = None, max_turns: int = MAX_TOOL_TURNS) -> dict[str, Any]:
     """Answer a plain-text user message through the LLM orchestrator.
 
     Returns {"text": str, ...} — plus proposal_id/kind/strategy_name/rationale
@@ -273,9 +281,33 @@ def run_agent(session_factory: Callable[[], Any], settings: Settings, user_text:
 
     Never raises for LLM/tool failures — returns a friendly reply instead.
     """
+    # Provider selection: the local Hermes Agent (USE_HERMES=true) takes
+    # precedence over the external OpenAI-compatible API (AI_API_KEY).
+    # ``settings.ai.enabled`` is set by config.load_settings() for either provider.
+    use_hermes = bool(getattr(settings.ai, "use_hermes", False))
     if not settings.ai.enabled:
-        return {"text": "🤖 AI assistant is not configured (set AI_API_KEY in .env and restart)."}
-    client = client or AIClient(config=settings.ai)
+        return {
+            "text": "🤖 AI assistant is not configured. Set AI_API_KEY in .env "
+                    "(external LLM) or USE_HERMES=true (local Hermes Agent), "
+                    "then restart the bot."
+        }
+    if client is None:
+        if use_hermes:
+            if not HERMES_AI_AVAILABLE:
+                return {
+                    "text": "🤖 USE_HERMES=true but the Hermes client module "
+                            "could not be imported. Reinstall the bot or unset "
+                            "USE_HERMES."
+                }
+            client = HermesAgentClient()
+            if not getattr(client, "enabled", False):
+                return {
+                    "text": "🤖 USE_HERMES=true but the `hermes` command was not "
+                            "found on PATH. Install Hermes Agent (or set "
+                            "AI_API_KEY) and restart the bot."
+                }
+        else:
+            client = AIClient(config=settings.ai)
 
     session = session_factory()
     try:
@@ -322,6 +354,11 @@ def run_agent(session_factory: Callable[[], Any], settings: Settings, user_text:
         return out
     except RecommendationError as exc:
         log.warning("chat agent LLM error: %s", exc)
-        return {"text": f"🤖 The LLM call failed: {exc}. Check AI_API_KEY / AI_BASE_URL / AI_MODEL."}
+        hint = (
+            "Check that the `hermes` command works (try: hermes chat -q 'hi')."
+            if use_hermes
+            else "Check AI_API_KEY / AI_BASE_URL / AI_MODEL."
+        )
+        return {"text": f"🤖 The LLM call failed: {exc}. {hint}"}
     finally:
         session.close()

@@ -31,12 +31,16 @@ controlled from Telegram. Modular monolith, one Python process, one asyncio even
 - **Strategies are files:** user/AI-authored strategies live in `strategies/*.py`,
   are AST-validated on load, and go live only after human approval.
 - **Execution is deterministic Python; AI is advisory only** (proposals need human approval).
+- **Advisory LLM provider:** either an external OpenAI-compatible API (`AI_API_KEY`)
+  or the **local Hermes Agent CLI** (`USE_HERMES=true`) — see `algotrading/hermes_ai/`.
+  Either one sets `settings.ai.enabled`; the nested Hermes call runs with a
+  terminal-free toolset so it cannot act on the machine.
 - **Modes:** `paper` (simulated fills vs live prices, no keys) / `live` (real orders, requires keys).
 - **Data:** SQLite (WAL), event-sourced trade lifecycle (`order_events` is the source of truth).
 - **Stack constraints (Termux/Android):** no ccxt (pulls Rust `cryptography`), no `openai` SDK
   (pulls Rust `jiter`), pydantic **v1** only, pure-Python indicators (no numpy/pandas).
 - Version: `algotrading/__init__.py` → `__version__ = "0.1.0"`.
-- Tests: `pytest tests/` (173 passing, all M0–M7 milestones; includes a full non-technical-user scenario in `tests/test_scenario_end_to_end.py`).
+- Tests: `pytest tests/` (185 passing, all M0–M7 milestones; includes a full non-technical-user scenario in `tests/test_scenario_end_to_end.py`).
 
 ## 2. How to run
 
@@ -71,6 +75,7 @@ AlgoTrading/
 │   ├── db/                   # SQLAlchemy models, engine/session, seeding
 │   ├── analytics/            # metrics from closed trades + periodic summaries
 │   ├── ai/                   # advisory LLM: client, prompt builder, assistant
+│   ├── hermes_ai/            # advisory LLM via the local Hermes Agent CLI (USE_HERMES)
 │   ├── store/                # recommendation lifecycle + versioned strategy release
 │   ├── telegram/             # control surface: bot bootstrap, commands, UI formatting
 │   ├── api/                  # optional FastAPI: /health (open), /status (bearer)
@@ -183,8 +188,10 @@ Telegram bot runs in the event loop with one session.
 | `algotrading/analytics/metrics.py` | Pure metric math | `compute_metrics`, `Metrics`, loss tags |
 | `algotrading/analytics/service.py` | Snapshot metrics into `analytics_summaries` | `AnalyticsService.run`, `run_daily` |
 | `algotrading/ai/client.py` | OpenAI-compatible chat client (requests) | `AIClient.complete_json`, `extract_json`, `RecommendationError` |
+| `algotrading/hermes_ai/client.py` | Advisory LLM via the local Hermes Agent CLI (`USE_HERMES=true`); prompts ship as `-q` args in a terminal-free, rule-free invocation | `HermesAgentClient` (`complete_json`, `enabled`), `parse_stream_json` (reads the `stream-json` `result` event — plain output echoes the query, so a naive text parse returns the *prompt's* JSON), `SAFE_TOOLSET`, env knobs `HERMES_CLI`/`HERMES_TOOLSETS`/`HERMES_TIMEOUT` |
+| `algotrading/hermes_ai/__init__.py` | Package export | `HermesAgentClient`, `parse_stream_json` |
 | `algotrading/ai/prompt_builder.py` | Deterministic prompt from local data | `build_prompt`, `build_feature_window` |
-| `algotrading/ai/assistant.py` | LLM → validated PENDING recommendation | `Assistant.propose`, `_validate` |
+| `algotrading/ai/assistant.py` | LLM → validated PENDING recommendation (client chosen from `settings.ai`: Hermes Agent or external API) | `Assistant.propose`, `_validate` |
 | `algotrading/store/recommendations.py` | Recommendation CRUD + human apply + pending creation | `RecommendationStore` (`pending`, `mark_rejected`, `apply`, `_shadow_backtest`), `create_pending_recommendation`, `allowed_strategy_names`, `ALLOWED_KINDS` (incl. `new_strategy` / `edit_strategy` / `new_indicator`); `apply` authors `new_strategy`/`edit_strategy` code *before* the shadow backtest (the name doesn't resolve otherwise) and skips it for `new_indicator` (a function, not a strategy) |
 | `algotrading/store/strategy_versions.py` | Controlled single-active release + strategy file writes | `latest_version`, `create_new_version`, `create_new_strategy`, `update_strategy_code`, `promote_to_active` |
 | `algotrading/telegram/bot.py` | PTB Application bootstrap + factories | `build_application`, `_make_approve`, `_make_reject`, `_make_backtest` (current vs default comparison, via `_current_params`), `_make_catalog_scores` (ranked scores, cached, threaded), `_stored_candles`, `run_bot` |
@@ -246,7 +253,8 @@ Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (bump + add mig
 | Change market timeframes | `config/settings.yaml` `market.intervals:` (1m,5m,15m,30m,1h,4h,1d) |
 | Add an API endpoint | `api/app.py` `build_api` (+ `require_token` for anything sensitive) |
 | New AI recommendation kind | `store/recommendations.py` `ALLOWED_KINDS` → `ai/assistant.py` + `telegram/chat.py` prompts → `apply` → approval flow |
-| Chat with the bot in natural language | `telegram/chat.py` (`run_agent` + tools); handler wired in `telegram/commands.py`; requires `AI_API_KEY` |
+| Chat with the bot in natural language | `telegram/chat.py` (`run_agent` + tools); handler wired in `telegram/commands.py`; requires the assistant to be enabled (`AI_API_KEY` **or** `USE_HERMES=true`) |
+| Run the advisory AI with no API key (local Hermes Agent) | `.env` `USE_HERMES=true` (sets `ai.enabled` in `config.py` `load_settings`) → `algotrading/hermes_ai/client.py` shells out to `hermes chat -q --format stream-json -t safe`; picked up by `telegram/chat.py` `run_agent` and `scheduler/jobs.py` `ai_review` |
 | Add a DB table / column | `db/models.py` + bump `SCHEMA_VERSION` in `db/__init__.py` |
 | Add a Binance endpoint | `market/binance_rest.py` (public vs signed helpers) |
 | Change fill/order behavior | `execution/paper_gateway.py` / `live_gateway.py` (keep the `ExchangeGateway` protocol) |
@@ -294,7 +302,10 @@ with correlation IDs (request/trace tracking). JSON fields configurable via
 | bot killed ~10s after start, in a loop | old watchdog kill window — a slow boot (wake-lock/network stall) can exceed it before the first heartbeat. Current `run_bot.sh` has a 300s grace period and a single-instance lock (`data/run_bot.lock`); remove a stale lock only when no `run_bot.sh` is running |
 | bot running but never replies | check `logs/algotrading.log` for `Ignoring non-allowlisted user <id>` — your Telegram user ID must be in `TELEGRAM_ALLOWED_USERS`; verify your ID via @userinfobot |
 | bot receives messages but replies fail ("No error handlers are registered" in log) | MarkdownV2 parse errors on unescaped `_ ( ) .` — the telegram layer now uses HTML parse mode (`TEXT_MARKDOWN = "HTML"` in `commands.py`); HTML only treats `< > &` specially, which our texts never contain |
-| AI never proposes | `ai.enabled` false (no `AI_API_KEY`), or PENDING rec already exists (one-open-question rule), or `_validate` rejected output |
+| AI never proposes | `ai.enabled` false (no `AI_API_KEY` and `USE_HERMES` unset), or PENDING rec already exists (one-open-question rule), or `_validate` rejected output |
+| "AI assistant is not configured" even though `USE_HERMES=true` | the bot was started before the `.env` edit (settings are read once at startup), or the value isn't one of `true/1/yes/on` | restart the bot; `USE_HERMES=true` must set `settings.ai.enabled` in `config.py` `load_settings` |
+| "USE_HERMES=true but the `hermes` command was not found on PATH" | `shutil.which("hermes")` failed from the bot's environment (`hermes_ai/client.py`); `algobot start` inherits the shell's PATH | run `hermes --version` in the same shell (or pin `HERMES_CLI=/abs/path/hermes`), otherwise set `AI_API_KEY` |
+| "Hermes CLI returned no answer" / "did not return JSON" | the nested agent printed no `{"type":"result"}` event, exited early, or answered with prose instead of the expected JSON | reproduce with `hermes chat -q 'hi'`; raise `HERMES_TIMEOUT` if it is only slow; see `logs/algotrading.log` |
 | strategy eval broken after release | version `retired/active` mismatch in `store/strategy_versions.py`; params JSON invalid → engine logs "Cannot build active strategy" |
 | `No module named algotrading/main` | bot started from wrong directory (see §2) |
 | schema/migration issues | `SCHEMA_VERSION` + `meta` table; derived tables are rebuilt from `order_events`, never hand-edit |
@@ -317,6 +328,7 @@ deterministic fix.
 | `test_m6c.py` | recommendation store + apply, assistant validation, versioned release |
 | `test_telegram.py` | allowlist auth, /status formatting, approval flow, /strategies catalog (built-ins + plugins, truncation, risk-adjusted ranking) and its `bt:` backtest buttons (current-vs-default comparison, verdict) |
 | `test_chat.py` | LLM chat orchestrator: tools (backtest/propose_change), safety contract |
+| `test_hermes_ai.py` | Hermes Agent provider: `stream-json` result-event parsing (must not return the echoed prompt's JSON), terminal-free toolset invocation, `USE_HERMES` enabling the assistant with no `AI_API_KEY`, chat gating when the CLI is missing |
 | `test_api.py` | /health open, /status bearer-guarded |
 | `test_live_gateway.py` | live gateway + supervisor units |
 | `test_backtest.py` | shadow backtest replay + equity summary |
@@ -353,7 +365,7 @@ deterministic fix.
 
 1. **Intent-before-order:** persist `trade_intent` w/ unique `idempotency_key` before any order; retries reuse it.
 2. **Event-sourced ledger:** `order_events` immutable; positions/trades are derived views.
-3. **AI advisory only:** proposals PENDING until human approval; AI never touches exchange or active strategy. This includes chat: the LLM orchestrator (`telegram/chat.py`) can read state, research, and backtest, but the only way it can change anything is `propose_change` (PENDING).
+3. **AI advisory only:** proposals PENDING until human approval; AI never touches exchange or active strategy. This includes chat: the LLM orchestrator (`telegram/chat.py`) can read state, research, and backtest, but the only way it can change anything is `propose_change` (PENDING). When the provider is the local Hermes Agent, the nested call runs terminal-free (`hermes chat -q --format stream-json -t safe --ignore-rules`), so the agent cannot run commands or edit files either.
 4. **One active strategy version** at a time (`store/strategy_versions.py`).
 5. **Stale-data freeze:** no new entries when candles too old (protective exits only).
 6. **Live requires keys + explicit mode;** bot refuses to start otherwise.
