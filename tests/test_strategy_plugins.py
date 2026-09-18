@@ -19,6 +19,7 @@ from algotrading.strategy.plugins import (
     configure_default_loader,
     get_default_loader,
 )
+from algotrading.strategy.validation import CodeValidationError, compile_strategy
 from algotrading.strategy.registry import (
     UnknownStrategyError,
     build_strategy,
@@ -233,3 +234,201 @@ def test_plugin_params_persisted_in_version_row(session, plugin_dir):
     )
     row = session.query(Strategy).filter(Strategy.name == "momentum_nudge").one()
     assert json.loads(row.params)["lookback"] == 9
+
+
+# --- ensemble components -----------------------------------------------------
+# An AI-authored strategy is a plugin, so the ensemble must resolve components
+# through the registry: before this, an ensemble built from image-derived
+# strategies failed at approval time with "unknown strategy: <plugin>".
+
+def test_ensemble_accepts_a_plugin_component(plugin_dir):
+    get_default_loader().write_strategy("momentum_nudge", PLUGIN_CODE, params=[])
+    ensemble = build_strategy("ensemble", {
+        "mode": "consensus",
+        "components": [
+            {"name": "momentum_nudge", "params": {"lookback": 2}},
+            {"name": "ema_crossover", "params": {"fast_period": 9, "slow_period": 21}},
+        ],
+    })
+
+    # Steady climb (no fresh EMA cross) then one up-tick: only the plugin fires.
+    candles = _candles([100.0 + i for i in range(30)] + [129.5, 130.0])
+    signal = ensemble.evaluate("BTC/USDT", candles)
+
+    assert signal is not None, "the plugin component's signal must reach the ensemble"
+    assert signal.side == "buy"
+    assert "plugin momentum up-tick" in signal.rationale
+
+
+def test_ensemble_rejects_an_unknown_component(plugin_dir):
+    with pytest.raises(UnknownStrategyError):
+        build_strategy("ensemble", {
+            "components": [
+                {"name": "does_not_exist", "params": {}},
+                {"name": "ema_crossover",
+                 "params": {"fast_period": 9, "slow_period": 21}},
+            ],
+        })
+
+
+# --- imports inside authoring code -------------------------------------------
+# `strategies/README.md` documents `from algotrading.strategy import indicators
+# as ta`, so that (and the bare `indicators` form models write) has to execute.
+# Before this, the sandbox had no __import__ at all and approval died with
+# "failed to execute strategy code: __import__ not found".
+
+IMPORTING_CODE = '''
+from algotrading.strategy import indicators as ta
+
+
+class ImportingEma:
+    """Buy when the close sits above its own SMA."""
+
+    def __init__(self, params=None):
+        self.params = params or {}
+        self.period = int(self.params.get("period", 3))
+
+    def evaluate(self, symbol, candles):
+        closes = [c.close for c in candles]
+        avg = ta.sma(closes, self.period)[-1]
+        if avg is not None and closes[-1] > avg:
+            return Signal(
+                strategy_id=0, symbol=symbol, side="buy", ref_price=closes[-1],
+                rationale="close above SMA", risk={"position_pct": 0.1},
+            )
+        return None
+'''
+
+
+def test_documented_indicator_import_compiles_and_runs():
+    cls = compile_strategy(IMPORTING_CODE, "importing_ema")
+    strategy = cls({"period": 3})
+    signal = strategy.evaluate("BTC/USDT", _candles([100.0, 100.0, 101.0]))
+    assert signal is not None and signal.side == "buy"
+
+
+def test_bare_indicators_import_is_aliased():
+    code = IMPORTING_CODE.replace(
+        "from algotrading.strategy import indicators as ta", "from indicators import sma"
+    ).replace("ta.sma(closes, self.period)", "sma(closes, self.period)")
+    cls = compile_strategy(code, "importing_ema_bare")
+    assert cls({"period": 3}).evaluate("BTC/USDT", _candles([100.0, 100.0, 101.0])) is not None
+
+
+def test_other_imports_are_rejected_with_a_hint():
+    code = IMPORTING_CODE.replace(
+        "from algotrading.strategy import indicators as ta", "import numpy"
+    )
+    with pytest.raises(CodeValidationError, match="not available to strategy code"):
+        compile_strategy(code, "importing_numpy")
+
+
+def test_package_import_cannot_reach_siblings():
+    code = IMPORTING_CODE.replace(
+        "from algotrading.strategy import indicators as ta",
+        "from algotrading.strategy import registry as ta",
+    )
+    with pytest.raises(CodeValidationError, match="not available to strategy code"):
+        compile_strategy(code, "importing_sibling")
+
+
+def test_forbidden_import_still_reports_forbidden():
+    code = IMPORTING_CODE.replace(
+        "from algotrading.strategy import indicators as ta", "import os"
+    )
+    with pytest.raises(CodeValidationError, match="forbidden import"):
+        compile_strategy(code, "importing_os")
+
+
+def test_runtime_import_hook_is_the_second_layer():
+    """Even with the AST check bypassed, the hook refuses."""
+    from algotrading.strategy.validation import safe_namespace
+
+    builtins_map = safe_namespace()["__builtins__"]
+    with pytest.raises(ImportError):
+        builtins_map["__import__"]("os")
+    assert builtins_map["__import__"]("math") is not None
+
+
+def test_new_strategy_proposal_rejects_uncompilable_code(session, plugin_dir):
+    """Bad code must fail at propose time, while the model can still fix it."""
+    with pytest.raises(ValueError, match="template rejected"):
+        _new_strategy_rec(session, "broken_import", "import numpy\n\nclass X:\n    def evaluate(self, s, c):\n        return None\n")
+
+    with pytest.raises(ValueError, match="template rejected"):
+        _new_strategy_rec(session, "no_evaluate", "class X:\n    pass\n")
+
+
+# --- constructor shape -------------------------------------------------------
+# The engine builds strategies as cls(params_dict). A keyword-style constructor
+# used to load fine and then blow up on every build (backtest, engine, ensemble).
+
+KEYWORD_CTOR_CODE = '''
+class KeywordCtor:
+    """Would explode as cls(params_dict)."""
+
+    def __init__(self, period=14):
+        self.period = int(period)
+
+    def evaluate(self, symbol, candles):
+        return None
+'''
+
+
+def test_keyword_constructor_is_rejected_with_a_fix_hint():
+    with pytest.raises(CodeValidationError, match=r"def __init__\(self, params=None\)"):
+        compile_strategy(KEYWORD_CTOR_CODE, "keyword_ctor")
+
+
+def test_class_without_a_constructor_is_rejected():
+    with pytest.raises(CodeValidationError, match="params_dict"):
+        compile_strategy("class Bare:\n    def evaluate(self, s, c):\n        return None\n",
+                         "bare")
+
+
+def test_params_dict_constructor_passes_the_probe():
+    """A constructor that reads dict keys (KeyError on {}) is a valid shape."""
+    code = '''
+class ReadsDict:
+    """Reads params with a default."""
+
+    def __init__(self, params=None):
+        self.period = int((params or {}).get("period", 5))
+
+    def evaluate(self, symbol, candles):
+        return None
+'''
+    assert compile_strategy(code, "reads_dict") is not None
+
+
+def test_propose_time_gate_rejects_a_keyword_constructor(session, plugin_dir):
+    with pytest.raises(ValueError, match="template rejected"):
+        _new_strategy_rec(session, "keyword_ctor", KEYWORD_CTOR_CODE)
+
+
+def test_failed_write_does_not_poison_the_name(session, plugin_dir, monkeypatch):
+    """A write that fails to load must leave no file behind.
+
+    Without the cleanup, the name stays taken forever ("already exists") even
+    after the author fixes the code — exactly what happened when a generated
+    strategy failed at load time.
+    """
+    from algotrading.store.strategy_versions import create_new_strategy
+
+    loader = get_default_loader()
+
+    def failing_load(path):
+        raise StrategyPluginError("simulated load failure")
+
+    monkeypatch.setattr(loader, "load_file", failing_load)
+    with pytest.raises(ValueError, match="cannot create strategy"):
+        create_new_strategy(session, "broken_load", PLUGIN_CODE, params={},
+                            param_schema=[], indicator_deps=[])
+
+    assert not (plugin_dir / "broken_load.py").exists(), "the half-made file must go"
+
+    # The name is free again once the code is fixable.
+    monkeypatch.undo()
+    create_new_strategy(session, "broken_load", PLUGIN_CODE, params={},
+                        param_schema=[], indicator_deps=[])
+    assert loader.get_class("broken_load") is not None

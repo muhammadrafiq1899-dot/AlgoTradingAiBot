@@ -15,6 +15,7 @@ data/*.db-wal
 data/*.db-shm
 data/heartbeat
 data/backups/
+data/uploads/
 data/run_bot.lock
 logs/*.log
 *.pid

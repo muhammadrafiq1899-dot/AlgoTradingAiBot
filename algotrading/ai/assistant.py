@@ -20,7 +20,7 @@ from algotrading.ai.prompt_builder import build_prompt
 from algotrading.db.models import AIRecommendation
 from algotrading.market.base import Candle
 from algotrading.strategy.registry import is_plugin
-from algotrading.strategy.validation import CodeValidationError, validate_strategy_code
+from algotrading.strategy.validation import CodeValidationError, compile_strategy
 from algotrading.store.recommendations import (
     ALLOWED_KINDS,
     PENDING,
@@ -63,10 +63,12 @@ class Assistant:
     def _validate_ast(self, code: str) -> None:
         """Validate generated strategy code using the shared safety gate.
 
-        Raises RecommendationError if the code is unsafe or malformed.
+        Full compile, not just the AST walk: the code must also be *buildable*
+        (``cls(params_dict)``) or the proposal would pass review and then die at
+        approval. Raises RecommendationError if the code is unsafe or malformed.
         """
         try:
-            validate_strategy_code(code)
+            compile_strategy(code, self._strategy_name)
         except CodeValidationError as exc:
             raise RecommendationError(str(exc)) from exc
 

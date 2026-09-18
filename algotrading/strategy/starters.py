@@ -477,14 +477,31 @@ class EMAPercentageStrategy:
         return None
 
 
+def _build_component(name: str, params: dict[str, Any]):
+    """Instantiate one ensemble component by name.
+
+    Goes through the strategy registry (built-ins first, then plugin files), so a
+    strategy the AI authored from a screenshot is a valid component. Imported
+    lazily because the registry imports this module.
+    """
+    from algotrading.strategy.registry import build_strategy
+
+    return build_strategy(name, params)
+
+
 class EnsembleStrategy:
     """Combine multiple strategies with voting/filtering logic.
 
     Modes:
-      - consensus: ALL must agree on side (buy/sell)
+      - consensus: no component disagrees with the majority side (a component
+        that stays silent does not veto, so a lone signal can pass)
       - any: ANY signals buy -> buy, ANY signals sell -> sell
       - filter: primary strategy gated by filter strategy (both must agree)
       - weighted: weighted vote by position_pct
+
+    Components are resolved through the strategy registry, so an AI/user-authored
+    plugin strategy (``strategies/*.py``) can be a component alongside the
+    built-ins.
     """
 
     name = "ensemble"
@@ -503,11 +520,7 @@ class EnsembleStrategy:
         for comp in components:
             if not isinstance(comp, dict) or "name" not in comp:
                 raise ValueError("each component must have 'name' and 'params'")
-            strat_name = comp["name"]
-            strat_params = comp.get("params", {})
-            if strat_name not in STRATEGIES:
-                raise ValueError(f"unknown strategy: {strat_name}")
-            self.strategies.append(STRATEGIES[strat_name](strat_params))
+            self.strategies.append(_build_component(comp["name"], comp.get("params", {})))
 
     def evaluate(self, symbol: str, candles: Sequence[Candle]) -> Signal | None:
         if len(self.strategies) < 2:

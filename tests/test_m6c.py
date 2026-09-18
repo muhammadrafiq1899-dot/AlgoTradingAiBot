@@ -172,3 +172,29 @@ def test_assistant_accepts_rsi_mean_reversion(session):
     assert rec is not None
     assert rec.status == "pending"
     assert json.loads(rec.content_json)["params"]["period"] == 14
+
+
+def test_promoting_retires_every_other_active_strategy(session):
+    """Exactly one active strategy exists — the engine picks it by version alone.
+
+    Retiring only the same name's version left two rows active, and
+    `StrategyEngine.get_active_strategy` orders by version without filtering by
+    name, so a freshly approved strategy could silently not take over.
+    """
+    from algotrading.strategy.engine import StrategyEngine
+    from algotrading.config import Settings, MarketConfig
+
+    # A second strategy (a new name) becomes active...
+    other = create_new_version(session, "ensemble", {"mode": "consensus"})
+    promote_to_active(session, other)
+    # ...then the original name gets a new version, which must win.
+    newer = create_new_version(session, "ema_crossover", {"fast_period": 9})
+    promote_to_active(session, newer)
+
+    actives = session.execute(
+        select(Strategy).where(Strategy.status == "active")
+    ).scalars().all()
+    assert [(row.name, row.version) for row in actives] == [("ema_crossover", 2)]
+
+    engine = StrategyEngine(session, Settings(market=MarketConfig(symbols=["BTC/USDT"])))
+    assert engine.get_active_strategy().name == "ema_crossover"

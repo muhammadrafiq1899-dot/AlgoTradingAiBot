@@ -10,8 +10,44 @@ you tap **Approve** or it doesn't happen.
 > paper (or real) trades on Binance. You talk to it in Telegram. You can ask the
 > AI for a new strategy in plain English and it drafts one for your approval.
 
-**Status:** all milestones complete · **173 tests pass** (`pytest tests/`).
+**Status:** all milestones complete · **230 tests pass** (`pytest tests/`).
 Version `0.1.0`.
+
+---
+
+## Changelog
+
+### 2026-09-18 — read images, and combine strategies
+
+- **Send a picture in Telegram** (needs `USE_HERMES=true`): a chart, a
+  TradingView idea, or a strategy you wrote down. The assistant reads it, says
+  what it sees, maps it to the closest strategy, backtests it, and drafts what is
+  missing as an Approve / Reject card. Uploads are capped at 5 MB and deleted as
+  soon as the AI has read them.
+- **Several pictures at once.** Send an album (or a quick burst of photos) and the
+  bot asks how to read them: 🧩 *one strategy from all* — entry from one picture,
+  filter from another, sized from a third, written as one strategy — or 🧱
+  *separate strategies → ensemble* — each picture becomes its own strategy, then
+  one ensemble votes on their signals. Batches handle up to 6 images, expire after
+  15 minutes, and are not kept across restarts.
+- **Ensembles can reference AI-written strategies.** Combining a strategy the
+  assistant wrote from a screenshot with a built-in now works; approval used to
+  fail with "unknown strategy".
+- **Approving a strategy really switches it.** Promoting retires every other active
+  version, so the strategy you just approved is the one running. Before, the engine
+  could silently keep an older-but-higher-numbered active strategy in charge.
+- **Generated strategies fail early, not at approval.** Authored code is fully
+  compiled and built before it becomes a proposal: the documented
+  `from algotrading.strategy import indicators as ta` now actually executes,
+  keyword-style constructors (`def __init__(self, period=14)`) are refused with the
+  fix spelled out, imports are limited to the indicator helpers / `math` /
+  `statistics`, and a failed write no longer blocks the strategy name afterwards.
+- **Ensemble modes described honestly.** The assistant states the implemented
+  semantics — `consensus` means "no component that fired disagreed" (a lone signal
+  can pass), not "every component must agree".
+- **Truncated model answers** (the provider occasionally cuts a long reply
+  mid-sentence) no longer lose the turn: the readable part is kept.
+- Test suite grew from 185 to 230 tests.
 
 ---
 
@@ -198,6 +234,22 @@ Two ways to interact:
   - *"Backtest a faster EMA crossover — 5 and 20."*
   - *"That last loss looks like it bought too late. Can we fix that?"*
   - *"Create a strategy that buys after three red candles."*
+- **A photo or screenshot** (with `USE_HERMES=true`) — send a picture of a chart,
+  a TradingView idea, or a strategy you wrote down, and the assistant reads it,
+  tells you which built-in strategy is closest, backtests it on your stored
+  candles, and offers to draft the missing pieces as an Approve / Reject card.
+  Add a caption if you want to be specific (*"backtest this"*); without one it
+  works out what to do from the picture. Images are capped at 5 MB and the file
+  is deleted from the phone as soon as the AI has read it.
+- **Several pictures at once** — send an album (or a quick burst of photos) and
+  the bot asks how to read them:
+  - **🧩 One strategy from all** — it reads every image and writes *one* strategy
+    that combines the rules (entry from one picture, filter from another, sized
+    from a third). One proposal to approve.
+  - **🧱 Separate strategies → ensemble** — each image becomes its own strategy
+    with its own proposal. Approve the ones you like, then ask it to *"combine
+    those strategies into an ensemble"*: that drafts an ensemble which votes on
+    their signals, and approving the ensemble makes it your active strategy.
 
 The assistant can read your bot's state, look at price history, run backtests,
 and **draft** changes. It will hand you an Approve / Reject card for anything
@@ -270,6 +322,38 @@ That enables two things:
    analytics and, if it has an idea, sends you a proposal card on Telegram. You
    approve or reject it.
 2. **Free-form chat.** Ask anything about your bot in plain language.
+
+**Reading images.** With `USE_HERMES=true` you can also send a photo or screenshot
+instead of typing: the picture is handed to the local agent, which describes what
+it sees, maps it to the closest strategy in the catalog, backtests it on your
+stored candles, and proposes whatever is missing (still PENDING until you tap
+Approve). Only the Hermes provider can do this — with plain `AI_API_KEY` the bot
+replies that images need `USE_HERMES=true` rather than ignoring the picture.
+Text *inside* an image is treated as data, never as an instruction: if a picture
+tries to tell the assistant to change modes or ignore its rules, it refuses and
+tells you what it said.
+
+**Two ways to combine several pictures.** Send more than one image at a time and
+the bot asks which you want (🧩 one strategy from all, or 🧱 separate strategies →
+ensemble). They are genuinely different tools:
+
+- **One strategy from all** is right when the pictures are *parts of one idea*
+  (entry rule, exit rule, filter, sizing). The assistant reads each picture, then
+  writes a single strategy containing all of it — one proposal, one approval.
+- **An ensemble** is right when each picture is a *complete strategy* that should
+  agree before trading. Each component is approved on its own (so you can backtest
+  and rank them individually), then the ensemble combines their signals. Modes are
+  `consensus`, `any`, `filter` and `weighted`. Be precise about what they mean:
+  `consensus` means *no component that fired disagreed* — a single strategy
+  signalling can still pass, so it is not "everyone must agree". `filter` uses
+  whichever component fires first as the primary. Ask the assistant to explain the
+  mode it picked.
+
+**Combining image-derived strategies.** An ensemble can reference strategies the
+assistant wrote for you (they are ordinary files in `strategies/`), but only once
+those strategies exist — so approve each component first, then ask for the
+ensemble. Approving an ensemble releases a new version and makes it the active
+strategy (exactly one strategy is live at a time).
 
 **What it can propose:**
 
@@ -363,10 +447,20 @@ something goes wrong:
 | "AI assistant is not configured" | Neither provider is switched on | Set `AI_API_KEY` **or** `USE_HERMES=true` in `.env`, then restart |
 | "USE_HERMES=true but the `hermes` command was not found" | Hermes Agent isn't on the bot's PATH | Install Hermes Agent (`hermes --version` in the same shell), or set `AI_API_KEY` instead |
 | "The LLM call failed: Hermes CLI returned no answer" | The local agent produced no parsable answer | Run `hermes chat -q 'hi'` in the same shell to check it works; raise `HERMES_TIMEOUT` in `.env` if it's just slow |
+| Sending a photo gets "needs the local Hermes Agent" | The assistant is on the external API, which can't see images | Set `USE_HERMES=true` in `.env` and restart, or describe the strategy in text |
+| Several photos arrive and nothing is read yet | They are being buffered so they can be answered together | Wait a second; you then get the 🧩/🧱 choice buttons |
+| The image-choice buttons say "expired" | More than 15 minutes passed, or the bot restarted (pending batches are not saved) | Send the pictures again |
+| "(Only the first 6 are used.)" | You sent more images than `IMAGE_BATCH_LIMIT` | Send them in smaller groups, or raise the limit in `telegram/commands.py` |
+| An ensemble proposal fails with "unknown strategy: …" | A component was never approved, so the name doesn't exist yet | Approve the component strategies first, then re-draft the ensemble |
+| Sending a photo gets "I couldn't download that image" | Telegram file fetch failed, or the file was empty | Send it again; a screenshot attached as a file works too |
+| "That image is X MB — I read up to Y MB" | The upload is bigger than `ai.image_max_bytes` (5 MB by default) | Raise it in `config/settings.yaml`, or send a smaller screenshot |
 | "No candles stored yet" | It hasn't collected prices yet | Wait a minute, or check the logs |
 | "data stale; freezing new entries" | The price feed stopped | Usually temporary; check your connection |
 | "no candles fetched" every minute | Can't reach Binance | Check internet / whether Binance is blocked in your region |
 | A signal exists but no trade happened | A risk rule blocked it | `/risk` shows your limits; the log records the reason |
+| Approving says "template rejected: import 'pandas' is not available" | Generated code tried to import something outside the sandbox | It never becomes a proposal: the model is told immediately and rewrites it |
+| Approving says "strategy cannot be built as cls(params_dict)" | Generated code used a keyword constructor instead of taking the params dict | Same: refused at propose time with the fix spelled out (also true for hand-written plugins) |
+| An AI-authored strategy sits in `strategies/` but never loads | It failed validation, so the loader skipped it and logged why | `algobot logs 200` shows the reason; fix the constructor shape / imports |
 | The bot keeps restarting | Something crashes on startup | `algobot logs 200` and read the bottom |
 | It replies but formatting looks wrong | Telegram rejected the message | Check the log for parse errors; the bot uses HTML formatting |
 
@@ -546,7 +640,7 @@ their behaviour with `param_change`.
 | `market` | `exchange`, `symbols`, `intervals`, `backfill_days`, `poll_seconds`, `max_staleness_seconds` |
 | `risk` | `paper_initial_balance`, `risk_per_trade_pct`, `max_position_pct`, `max_open_positions`, `cooldown_seconds`, `max_daily_loss_pct`, `slippage_pct`, `trailing_stop_pct` |
 | `schedule` | `market_tick_seconds`, `analytics_minutes`, `daily_analytics_hour`, `ai_review_hour`, `reconcile_minutes` |
-| `ai` | `enabled`, `base_url`, `model`, `temperature`, `max_recommendations_per_review` |
+| `ai` | `enabled`, `base_url`, `model`, `temperature`, `max_recommendations_per_review`, `images_enabled`, `image_max_bytes`, `image_dir` |
 | `api` | `enabled`, `host`, `port` |
 | `log_level`, `log_format`, `log_json_fields` | text/json logging |
 | `strategy.hot_reload` | watch config files for changes |
@@ -598,9 +692,10 @@ order.
 `telegram/commands.py` `build_handlers(...)` returns PTB handlers with a strict
 allowlist decorator and per-user rate limiting (10 requests / 60s):
 
-- Commands: `/help`, `/status`, `/strategies`, `/strategy`, `/risk`, `/summary`, `/start_bot`, `/stop_bot`.
-- Callbacks: `approve:<id>`, `reject:<id>`, `bt:<strategy_name>`.
-- Plain text → the chat orchestrator.
+| Commands: `/help`, `/status`, `/strategies`, `/strategy`, `/risk`, `/summary`, `/start_bot`, `/stop_bot`.
+| Callbacks: `approve:<id>`, `reject:<id>`, `bt:<strategy_name>`.
+| Plain text → the chat orchestrator.
+| Photo / image file → the same orchestrator with the picture attached (Hermes provider only).
 
 **`/strategies`** renders `strategy/catalog.py` `catalog_entries()` (built-ins
 from `config/strategies.yaml` + plugin metadata) through
@@ -622,6 +717,41 @@ turns, and a friendly-failure contract (LLM/tool errors become replies, never
 crashes). The system prompt's strategy catalog is rebuilt every message from the
 live registry, so an AI-created plugin is visible to the very next turn. The
 only mutating tool persists a PENDING recommendation.
+
+**Image input** (`commands.collect_image` → `chat.run_agent(image_path(s)=...)` →
+`hermes_ai/client.py` `--image`): a photo or image document is downloaded to
+`data/uploads/` (cap `ai.image_max_bytes`, checked before *and* after the
+download), attached to every turn of the agent loop, then deleted. Gating runs
+before any bytes move — assistant enabled, `ai.images_enabled`, and the provider
+must be the Hermes CLI, because the external `AIClient` has no vision path and
+answers with a hint instead. An image call allows `--max-turns 2` (the nested
+agent spends a turn on `vision_analyze`) while `-t safe` keeps it terminal-free;
+`IMAGE_INPUT_PROMPT` is appended to the system prompt for image turns only, and
+hard rule 5 tells the agent to treat text inside a picture as data, not orders.
+
+**Several images at once** are buffered per chat for `PHOTO_BATCH_DELAY_SECONDS`
+(albums arrive as one message per photo, and clients send bursts as separate
+messages — both must be answered once). One picture takes the direct path above.
+A larger batch stashes its uploads under a short token and sends the 🧩/🧱 choice
+keyboard; the `imgflow:<token>:<mode>` callback then runs either *combine*
+(`run_agent(image_paths=[...])`: one vision pass per image via `complete_text`,
+then a single text-only tool loop over the transcripts, so all pictures inform one
+strategy) or *separate* (one agent call per image, then a follow-up pointing at the
+ensemble step). Batches are in-memory, capped at `IMAGE_BATCH_LIMIT`, expire after
+`IMAGE_FLOW_TTL_SECONDS`, and their files are deleted once read.
+
+Because the provider occasionally cuts a long answer mid-string (a truncated
+transcription was observed for real), the Hermes client also exposes
+`complete_text()` for verbatim answers and `salvage_partial_reply()`: a fragment
+that is clearly a `reply` keeps its partial text instead of failing the turn,
+while a truncated *tool* call stays an error rather than guessing arguments.
+
+**Ensembles** are built by `EnsembleStrategy`, whose components resolve through
+`strategy.registry.build_strategy` — built-ins first, then plugin files — so a
+strategy the assistant wrote from a screenshot is a valid component. Note the
+implemented semantics (verified against a real candle series): `consensus` fires
+when no *firing* component disagrees, and `filter` treats the first firing
+component as the primary, so neither is a strict "both must agree".
 
 ## 21. The HTTP API
 
@@ -675,7 +805,7 @@ chmod +x ~/.termux/services/algotrading/run
 ## 24. Testing
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 173 tests
+.venv/bin/python -m pytest tests/ -q          # 230 tests
 bash scripts/check_project_map.sh             # map freshness
 .venv/bin/python -m compileall -q algotrading # byte-compile check
 ```
@@ -689,22 +819,22 @@ bash scripts/check_project_map.sh             # map freshness
 | `test_analytics.py` | Metric math + summary persistence |
 | `test_ai.py` | AI client parsing, prompt determinism |
 | `test_m6c.py` | Recommendation store, assistant validation, versioned release |
-| `test_telegram.py` | Allowlist, formatting, approvals, `/strategies` ranking + backtest buttons |
+| `test_telegram.py` | Allowlist, formatting, approvals, `/strategies` ranking + backtest buttons, image batching + both image flows |
 | `test_chat.py` | Chat orchestrator tools + safety contract |
 | `test_api.py` | `/health` open, `/status` bearer-guarded |
 | `test_live_gateway.py` | Live gateway + supervisor units |
 | `test_backtest.py` | Backtest replay + equity summary |
 | `test_ema_percentage_strategy.py` | EMA % strategy signals |
 | `test_modules.py` | Module resolution, external loading, lifecycle, execution lock |
-| `test_strategy_plugins.py` | Plugin load/write/edit, safety rejection, hot-reload, AI authoring |
+| `test_strategy_plugins.py` | Plugin load/write/edit, safety rejection, hot-reload, AI authoring, plugin strategies as ensemble components |
 | **`test_scenario_end_to_end.py`** | **The whole product as a non-technical trader would use it** — setup wizard, startup, a real entry + trailing-stop exit, every Telegram command, chat-driven strategy creation and approval, analytics, API, and restart recovery |
 
 ## 25. Non-negotiable invariants
 
 1. **Intent-before-order** — persist `trade_intent` (unique key) before sending; retries reuse it.
 2. **Event-sourced ledger** — `order_events` is immutable; positions/trades are derived.
-3. **AI is advisory only** — proposals stay PENDING until a human approves; the AI never trades or edits the active strategy. The chat agent can only `propose_change`.
-4. **One active strategy version** at a time.
+3. **AI is advisory only** — proposals stay PENDING until a human approves; the AI never trades or edits the active strategy. The chat agent can only `propose_change`. Images don't change that: they ride along in the same terminal-free local-agent call, and text inside an image is treated as data, never instructions. An ensemble is a proposal too: components must already be approved, and the ensemble itself needs its own tap.
+4. **One active strategy version** at a time — promoting retires every other active row, so the strategy you just approved is the one actually running.
 5. **Stale-data freeze** — no new entries on stale candles; protective exits still run.
 6. **Live is explicit** — requires `mode: live` *and* keys, or the bot refuses to start.
 7. **Thread safety** — each job/thread opens its own DB session.

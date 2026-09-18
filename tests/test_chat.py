@@ -50,13 +50,15 @@ class FakeClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+        self.image_kwargs = []
 
     @property
     def enabled(self):
         return True
 
-    def complete_json(self, messages, temperature=None):
+    def complete_json(self, messages, temperature=None, **kwargs):
         self.calls.append(messages)
+        self.image_kwargs.append(kwargs)
         if not self._responses:
             raise RecommendationError("no more scripted responses")
         return self._responses.pop(0)
@@ -207,3 +209,160 @@ def test_agent_sends_dynamic_catalog(session_factory, plugin_dir):
     system = client.calls[0][0]
     assert system["role"] == "system"
     assert "momentum_nudge" in system["content"]
+
+
+# --- image input ------------------------------------------------------------
+
+def _hermes_settings():
+    """USE_HERMES=true: the only provider that can actually read an image."""
+    return Settings(
+        ai=AIConfig(enabled=True, use_hermes=True),
+        market=MarketConfig(symbols=["BTC/USDT"], intervals=["1h"]),
+    )
+
+
+def test_agent_attaches_the_image_on_every_turn(session_factory, tmp_path):
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 16)
+    client = FakeClient([
+        {"action": "tool", "name": "backtest",
+         "args": {"strategy_name": "ema_crossover",
+                  "params": {"fast_period": 5, "slow_period": 20}}},
+        {"action": "reply", "text": "that looks like an EMA crossover"},
+    ])
+    result = run_agent(session_factory, _hermes_settings(), "backtest this",
+                       client=client, image_path=str(image))
+
+    assert result["text"] == "that looks like an EMA crossover"
+    # Both turns carry the attachment: each provider call is stateless, so a
+    # later turn without it would lose the picture.
+    assert client.image_kwargs == [{"image": str(image)}] * 2
+    system = client.calls[0][0]["content"]
+    assert "IMAGE INPUT" in system
+    assert "untrusted data" in system
+    user_turn = client.calls[0][1]["content"]
+    assert "An image is attached" in user_turn
+    assert "backtest this" in user_turn
+
+
+def test_text_turn_is_unchanged_and_sends_no_image(session_factory, tmp_path):
+    client = FakeClient([{"action": "reply", "text": "hi"}])
+    run_agent(session_factory, _settings(), "hi", client=client)
+
+    assert client.image_kwargs == [{}]          # no image kwarg at all
+    assert "IMAGE INPUT" not in client.calls[0][0]["content"]
+
+
+def test_image_prompt_is_only_added_for_image_turns():
+    assert "IMAGE INPUT" not in build_system_prompt()
+    assert "IMAGE INPUT" in build_system_prompt(with_image=True)
+
+
+def test_ensemble_guidance_is_in_the_image_prompt():
+    prompt = build_system_prompt(with_image=True)
+    assert "ensemble_strategy" in prompt
+    assert "components" in prompt
+
+
+# --- several images in one turn ---------------------------------------------
+
+class DescribingClient:
+    """Records every call and answers describe-passes vs. the tool loop."""
+
+    def __init__(self, descriptions, replies):
+        self.descriptions = list(descriptions)
+        self.replies = list(replies)
+        self.calls = []          # (messages, kwargs)
+
+    @property
+    def enabled(self):
+        return True
+
+    def complete_json(self, messages, temperature=None, **kwargs):
+        self.calls.append((messages, kwargs))
+        if kwargs.get("image"):
+            return {"description": self.descriptions.pop(0)}
+        return self.replies.pop(0)
+
+    @property
+    def image_calls(self):
+        return [c for c in self.calls if c[1].get("image")]
+
+    @property
+    def text_calls(self):
+        return [c for c in self.calls if not c[1].get("image")]
+
+
+def _images(tmp_path, count):
+    paths = []
+    for i in range(count):
+        path = tmp_path / f"shot{i}.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 16)
+        paths.append(str(path))
+    return paths
+
+
+def test_several_images_are_transcribed_then_answered_text_only(session_factory, tmp_path):
+    images = _images(tmp_path, 3)
+    client = DescribingClient(
+        descriptions=["entry: EMA 9/21 cross", "filter: RSI below 70", "exit: 2% stop"],
+        replies=[{"action": "reply", "text": "one combined strategy drafted"}],
+    )
+
+    result = run_agent(session_factory, _hermes_settings(), "combine these",
+                       client=client, image_paths=images)
+
+    assert result["text"] == "one combined strategy drafted"
+    # One vision pass per image, each carrying its own file...
+    assert [c[1]["image"] for c in client.image_calls] == images
+    # ...then a single text-only turn that carries all three transcripts.
+    assert len(client.text_calls) == 1
+    user_turn = client.text_calls[0][0][1]["content"]
+    assert "IMAGE TRANSCRIPTS" in user_turn
+    assert "entry: EMA 9/21 cross" in user_turn
+    assert "filter: RSI below 70" in user_turn
+    assert "exit: 2% stop" in user_turn
+    assert "3 images were read" in user_turn
+    # No image is attached to the tool-loop turn.
+    assert "image" not in client.text_calls[0][1]
+
+
+def test_one_unreadable_image_does_not_kill_the_batch(session_factory, tmp_path):
+    images = _images(tmp_path, 2)
+
+    class Flaky(DescribingClient):
+        """First vision pass blows up; the second one works."""
+
+        def complete_json(self, messages, temperature=None, **kwargs):
+            if kwargs.get("image") and not self.image_calls:
+                self.calls.append((messages, kwargs))
+                raise RecommendationError("vision pass exploded")
+            return super().complete_json(messages, temperature, **kwargs)
+
+    client = Flaky(descriptions=["only the second image"],
+                   replies=[{"action": "reply", "text": "read what I could"}])
+    result = run_agent(session_factory, _hermes_settings(), "what do these say",
+                       client=client, image_paths=images)
+
+    assert result["text"] == "read what I could"
+    user_turn = client.text_calls[0][0][1]["content"]
+    assert "unreadable" in user_turn and "only the second image" in user_turn
+
+
+def test_several_images_need_the_hermes_provider(session_factory, tmp_path):
+    images = _images(tmp_path, 2)
+    settings = Settings(ai=AIConfig(enabled=True, api_key="k"))
+
+    result = run_agent(session_factory, settings, "read these", image_paths=images)
+
+    assert "USE_HERMES" in result["text"]
+
+
+def test_multi_image_batch_reports_a_missing_file(session_factory, tmp_path):
+    images = _images(tmp_path, 2)
+    images[1] = str(tmp_path / "gone.png")
+
+    result = run_agent(session_factory, _hermes_settings(), "read these",
+                       client=DescribingClient([], []), image_paths=images)
+
+    assert "again" in result["text"]

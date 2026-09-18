@@ -6,10 +6,16 @@ CallbackQueryHandler end-to-end against a stubbed query. No network is used.
 """
 import asyncio
 import json
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
+from telegram import Chat, Message, PhotoSize, Update, User
+from telegram.ext import MessageHandler
 
 from algotrading.backtest.runner import BacktestResult
 from algotrading.config import RiskConfig
@@ -34,7 +40,14 @@ from algotrading.telegram.bot import (
     _make_catalog_scores,
     _make_reject,
 )
-from algotrading.telegram.commands import build_handlers, reset_rate_limits
+from algotrading.telegram import commands as commands_module
+from algotrading.telegram.commands import (
+    IMAGE_CAPTION_FALLBACK,
+    UPLOAD_MAX_AGE_SECONDS,
+    build_handlers,
+    collect_image,
+    reset_rate_limits,
+)
 from algotrading.telegram.ui import (
     approval_keyboard,
     backtest_keyboard,
@@ -72,6 +85,15 @@ def _isolate_rate_limit():
     reset_rate_limits()
     yield
     reset_rate_limits()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_photo_batches(monkeypatch):
+    """Photo batches are process-global too — and photos answer instantly here."""
+    monkeypatch.setattr(commands_module, "PHOTO_BATCH_DELAY_SECONDS", 0)
+    commands_module.reset_photo_batches()
+    yield
+    commands_module.reset_photo_batches()
 
 
 @pytest.fixture()
@@ -576,3 +598,397 @@ def test_approve_missing_recommendation(session_factory):
     handlers = _approval_handlers(session_factory)
     q = asyncio.run(_click(_find_callback(handlers), "approve:999"))
     assert any("not found" in text for text, _ in q.message._sent), q.message._sent
+
+
+# --- image input: photo / image document -> LLM with the picture attached ---
+
+class FakeChat:
+    def __init__(self, id=1):
+        self.id = id
+        self.actions = []
+        self.sent = []          # (text, kwargs) from bot.send_message
+        self.markups = []
+
+    async def send_action(self, action):
+        self.actions.append(action)
+
+    async def send_chat_action(self, action, **kwargs):
+        self.actions.append(action)
+
+    async def send_message(self, chat_id, text=None, **kwargs):
+        self.sent.append((text, kwargs))
+        self.markups.append(kwargs.get("reply_markup"))
+        return None
+
+
+class FakeBot:
+    def __init__(self, payload=None, chat=None):
+        self.file = FakeTelegramFile(*(payload,) if payload else ())
+        self.requested = []
+        self.chat = chat or FakeChat()
+
+    async def get_file(self, file_id):
+        self.requested.append(file_id)
+        return self.file
+
+    async def send_message(self, chat_id, text=None, **kwargs):
+        return await self.chat.send_message(chat_id, text=text, **kwargs)
+
+    async def send_chat_action(self, chat_id, action, **kwargs):
+        return await self.chat.send_chat_action(action)
+
+
+class FakeContext:
+    def __init__(self, payload=None, chat=None):
+        self.chat = chat or FakeChat()
+        self.bot = FakeBot(payload, chat=self.chat)
+
+
+class FakeTelegramFile:
+    """Stands in for telegram.File: writes bytes where the handler asked."""
+
+    def __init__(self, payload=b"\x89PNG\r\n\x1a\n" + b"x" * 32):
+        self.payload = payload
+        self.saved_path = None
+
+    async def download_to_drive(self, path):
+        self.saved_path = path
+        with open(path, "wb") as fh:
+            fh.write(self.payload)
+
+
+class FakeImageMessage(FakeMessage):
+    """Message stub for photos/documents: a caption, never `text`."""
+
+    def __init__(self, photo=None, document=None, caption=None):
+        super().__init__()
+        self.photo = photo or []
+        self.document = document
+        self.caption = caption
+
+
+class FakePhotoSize:
+    def __init__(self, file_id="photo-1", file_size=1024):
+        self.file_id = file_id
+        self.file_size = file_size
+
+
+class FakeDocumentObject:
+    def __init__(self, file_id="doc-1", file_size=1024,
+                 mime_type="image/png", file_name="strategy.png"):
+        self.file_id = file_id
+        self.file_size = file_size
+        self.mime_type = mime_type
+        self.file_name = file_name
+
+
+def _ai_settings(upload_dir, **overrides):
+    """Settings stub with the ai.* fields the image path reads."""
+    fields = {"enabled": True, "use_hermes": True, "images_enabled": True,
+              "image_max_bytes": 5_000_000, "image_dir": str(upload_dir)}
+    fields.update(overrides)
+    return type("S", (), {"ai": type("AI", (), fields)(), "mode": "paper"})()
+
+
+def _image_update(user_id=1, message=None, chat=None):
+    update = FakeUpdate(user_id, message=message or FakeImageMessage(photo=[FakePhotoSize()]))
+    update.effective_chat = chat or FakeChat()
+    return update
+
+
+def _real_update(**message_kwargs):
+    """A genuine PTB Update, used only to probe handler filters."""
+    return Update(update_id=1, message=Message(
+        message_id=1, date=datetime.now(timezone.utc),
+        chat=Chat(id=1, type="private"),
+        from_user=User(id=1, first_name="x", is_bot=False),
+        **message_kwargs,
+    ))
+
+
+_PHOTO_PROBE = dict(photo=[PhotoSize(file_id="f", file_unique_id="u", width=8, height=8)])
+_TEXT_PROBE = dict(text="hello")
+
+
+def test_photo_updates_route_to_the_image_handler_only(session_factory, tmp_path):
+    handlers = build_handlers(
+        session_factory=session_factory,
+        settings=_ai_settings(tmp_path / "uploads"),
+        risk_cfg=RiskConfig(),
+        allowed_users=(1,),
+    )
+    message_handlers = [h for h in handlers if isinstance(h, MessageHandler)]
+    assert len(message_handlers) == 2, "text + image handlers"
+
+    photo_matches = [h for h in message_handlers if h.check_update(_real_update(**_PHOTO_PROBE))]
+    text_matches = [h for h in message_handlers if h.check_update(_real_update(**_TEXT_PROBE))]
+
+    assert len(photo_matches) == 1 and len(text_matches) == 1
+    assert photo_matches[0] is not text_matches[0], "a photo must not hit the text handler"
+
+
+def _image_handler(handlers):
+    """The registered handler that accepts photos (probed with a real Update)."""
+    probe = _real_update(**_PHOTO_PROBE)
+    return next(h for h in handlers
+                if isinstance(h, MessageHandler) and h.check_update(probe))
+
+
+def _fake_run_agent(record, response=None):
+    """Stand-in run_agent that records what the image flows hand it."""
+    def fake(_sf, _settings, text, image_path=None, image_paths=None, **kwargs):
+        record.append({
+            "text": text,
+            "image_paths": list(image_paths or []),
+            "existed": all(Path(p).is_file() for p in (image_paths or [])),
+            "bytes": Path(image_paths[0]).read_bytes()[:8] if image_paths else b"",
+        })
+        return response if response is not None else {"text": "ok"}
+    return fake
+
+
+def _image_handlers(session_factory, settings):
+    """The photo handler and the callback handler, wired like the real app."""
+    handlers = build_handlers(
+        session_factory=session_factory, settings=settings,
+        risk_cfg=RiskConfig(), allowed_users=(1,),
+    )
+    return _image_handler(handlers), _find_callback(handlers)
+
+
+async def _send_photo(handler, update, context):
+    """Run the photo handler, then the buffered flush it scheduled."""
+    await _run(handler, update, context)
+    await asyncio.sleep(0)                      # let the flush task start
+    task = commands_module._photo_batch_tasks.get(update.effective_chat.id)
+    if task is not None:
+        await task
+
+
+async def _send_batch(handler, updates, context):
+    """Send several photos back-to-back, the way an album arrives."""
+    for update in updates:
+        await _run(handler, update, context)
+    await asyncio.sleep(0)
+    task = commands_module._photo_batch_tasks.get(updates[0].effective_chat.id)
+    if task is not None:
+        await task
+
+
+async def _click_flow(handler, data, context):
+    update = FakeUpdate(user_id=1, callback_query=FakeQuery(data))
+    await _run(handler, update, context)
+    return update.callback_query
+
+
+def _flow_token(chat) -> str:
+    """The token of the choice keyboard last sent to a chat."""
+    markup = [m for m in chat.markups if m is not None][-1]
+    data = markup.to_dict()["inline_keyboard"][0][0]["callback_data"]
+    return data.split(":")[1]
+
+
+def test_single_photo_is_answered_and_its_upload_deleted(session_factory, tmp_path, monkeypatch):
+    settings = _ai_settings(tmp_path / "uploads")
+    calls = []
+    monkeypatch.setattr("algotrading.telegram.chat.run_agent",
+                        _fake_run_agent(calls, {"text": "that is an EMA crossover chart"}))
+    handler, _ = _image_handlers(session_factory, settings)
+    context = FakeContext()
+    update = _image_update(message=FakeImageMessage(
+        photo=[FakePhotoSize(file_id="photo-1")], caption="can I backtest this?"))
+
+    asyncio.run(_send_photo(handler, update, context))
+
+    assert context.bot.requested == ["photo-1"]
+    assert len(calls) == 1, "a lone photo is answered, not offered a choice"
+    assert calls[0]["text"] == "can I backtest this?"     # the caption is the question
+    assert calls[0]["existed"] is True                    # file outlives the AI call
+    assert calls[0]["bytes"].startswith(b"\x89PNG")
+    assert context.chat.sent[0][0] == "that is an EMA crossover chart"
+    assert not Path(calls[0]["image_paths"][0]).exists(), "upload must be cleaned up"
+
+
+def test_single_photo_without_caption_shows_the_proposal_card(session_factory, tmp_path, monkeypatch):
+    settings = _ai_settings(tmp_path / "uploads")
+    calls = []
+    monkeypatch.setattr("algotrading.telegram.chat.run_agent", _fake_run_agent(calls, {
+        "text": "proposed", "proposal_id": 7, "kind": "new_strategy",
+        "strategy_name": "squeeze_breakout", "rationale": "from your screenshot"}))
+
+    async def send():
+        handler, _ = _image_handlers(session_factory, settings)
+        context = FakeContext()
+        await _send_photo(handler, _image_update(), context)
+        return context
+
+    context = asyncio.run(send())
+
+    assert calls[0]["text"] == IMAGE_CAPTION_FALLBACK
+    sent = [text for text, _ in context.chat.sent]
+    assert sent[0] == "proposed"
+    assert "AI proposal #7" in sent[1] and "squeeze_breakout" in sent[1]
+
+
+def test_several_photos_are_batched_into_one_choice(session_factory, tmp_path, monkeypatch):
+    settings = _ai_settings(tmp_path / "uploads")
+    calls = []
+    monkeypatch.setattr("algotrading.telegram.chat.run_agent", _fake_run_agent(calls))
+    handler, _ = _image_handlers(session_factory, settings)
+    chat = FakeChat()
+    context = FakeContext(chat=chat)
+    updates = [
+        _image_update(chat=chat, message=FakeImageMessage(photo=[FakePhotoSize(file_id="p1")])),
+        _image_update(chat=chat, message=FakeImageMessage(
+            photo=[FakePhotoSize(file_id="p2")], caption="my exit rule")),
+    ]
+
+    asyncio.run(_send_batch(handler, updates, context))
+
+    assert calls == [], "batched photos must not be read one by one"
+    assert context.bot.requested == ["p1", "p2"]
+    text, kwargs = chat.sent[0]
+    assert "2 images received" in text
+    assert kwargs["reply_markup"] is not None, "the user must get the choice buttons"
+    assert _flow_token(chat) in commands_module._image_flows
+
+
+def test_choice_combine_reads_all_images_in_one_call(session_factory, tmp_path, monkeypatch):
+    settings = _ai_settings(tmp_path / "uploads")
+    calls = []
+    monkeypatch.setattr("algotrading.telegram.chat.run_agent",
+                        _fake_run_agent(calls, {"text": "one strategy coming up"}))
+    handler, callback = _image_handlers(session_factory, settings)
+    chat = FakeChat()
+    context = FakeContext(chat=chat)
+    updates = [
+        _image_update(chat=chat, message=FakeImageMessage(photo=[FakePhotoSize(file_id="p1")])),
+        _image_update(chat=chat, message=FakeImageMessage(
+            photo=[FakePhotoSize(file_id="p2")], caption="my exit rule")),
+    ]
+
+    async def run_flow():
+        await _send_batch(handler, updates, context)
+        return await _click_flow(callback, f"imgflow:{_flow_token(chat)}:combine", context)
+
+    query = asyncio.run(run_flow())
+
+    assert len(calls) == 1, "combine = one agent call over every image"
+    assert len(calls[0]["image_paths"]) == 2
+    assert calls[0]["existed"] is True
+    assert calls[0]["text"] == "my exit rule"           # caption carries into the flow
+    assert "Reading 2 images — one strategy from all" in query.message._sent[0][0]
+    assert chat.sent[-1][0] == "one strategy coming up"
+    assert all(not Path(p).exists() for p in calls[0]["image_paths"]), "uploads cleaned up"
+    assert not commands_module._image_flows, "the token is consumed"
+
+
+def test_choice_separate_reads_each_image_and_points_at_the_ensemble(
+    session_factory, tmp_path, monkeypatch
+):
+    settings = _ai_settings(tmp_path / "uploads")
+    calls = []
+    monkeypatch.setattr("algotrading.telegram.chat.run_agent",
+                        _fake_run_agent(calls, {"text": "one strategy per image"}))
+    handler, callback = _image_handlers(session_factory, settings)
+    chat = FakeChat()
+    context = FakeContext(chat=chat)
+    updates = [
+        _image_update(chat=chat, message=FakeImageMessage(photo=[FakePhotoSize(file_id="p1")])),
+        _image_update(chat=chat, message=FakeImageMessage(photo=[FakePhotoSize(file_id="p2")])),
+    ]
+
+    async def run_flow():
+        await _send_batch(handler, updates, context)
+        return await _click_flow(callback, f"imgflow:{_flow_token(chat)}:separate", context)
+
+    asyncio.run(run_flow())
+
+    assert len(calls) == 2, "separate = one agent call per image"
+    assert [len(c["image_paths"]) for c in calls] == [1, 1]
+    assert "ensemble" in chat.sent[-1][0], "the follow-up must point at the ensemble step"
+    assert all(not Path(p).exists() for c in calls for p in c["image_paths"])
+
+
+def test_unknown_or_expired_image_flow_is_friendly(session_factory, tmp_path):
+    settings = _ai_settings(tmp_path / "uploads")
+    handler, callback = _image_handlers(session_factory, settings)
+
+    query = asyncio.run(_click_flow(callback, "imgflow:deadbeef:combine", FakeContext()))
+
+    assert "expired" in query.message._sent[0][0]
+    assert not commands_module._image_flows
+
+
+def test_batches_bigger_than_the_limit_are_trimmed(session_factory, tmp_path, monkeypatch):
+    settings = _ai_settings(tmp_path / "uploads")
+    monkeypatch.setattr(commands_module, "IMAGE_BATCH_LIMIT", 2)
+    handler, _ = _image_handlers(session_factory, settings)
+    chat = FakeChat()
+    context = FakeContext(chat=chat)
+    updates = [
+        _image_update(chat=chat, message=FakeImageMessage(photo=[FakePhotoSize(file_id=f"p{i}")]))
+        for i in range(3)
+    ]
+
+    asyncio.run(_send_batch(handler, updates, context))
+
+    text = chat.sent[0][0]
+    assert "2 images received" in text
+    assert "Only the first 2" in text
+    assert len(commands_module._image_flows[_flow_token(chat)][1]) == 2
+
+
+def test_collect_image_gates_before_downloading(tmp_path):
+    cases = [
+        ({"enabled": False}, "not configured"),
+        ({"images_enabled": False}, "turned off"),
+        ({"use_hermes": False}, "USE_HERMES"),
+        ({"image_max_bytes": 10}, "MB"),          # 1 KB photo vs a 10-byte cap
+    ]
+    for overrides, expected in cases:
+        context = FakeContext()
+        path, error = asyncio.run(collect_image(
+            _image_update(), context, _ai_settings(tmp_path / "uploads", **overrides)
+        ))
+        assert path is None, overrides
+        assert expected in error, (overrides, error)
+        assert context.bot.requested == [], "gating must happen before any download"
+
+
+def test_collect_image_rejects_a_non_image_document(tmp_path):
+    context = FakeContext()
+    path, error = asyncio.run(collect_image(
+        _image_update(message=FakeImageMessage(
+            document=FakeDocumentObject(mime_type="application/pdf", file_name="plan.pdf")
+        )),
+        context,
+        _ai_settings(tmp_path / "uploads"),
+    ))
+    assert path is None
+    assert "only read images" in error
+    assert context.bot.requested == []
+
+
+def test_collect_image_accepts_a_document_and_prunes_stale_uploads(tmp_path):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    stale = uploads / "img-1-1.jpg"
+    stale.write_bytes(b"old")
+    old = time.time() - (UPLOAD_MAX_AGE_SECONDS + 60)
+    os.utime(stale, (old, old))
+
+    context = FakeContext()
+    path, error = asyncio.run(collect_image(
+        _image_update(message=FakeImageMessage(
+            document=FakeDocumentObject(file_id="doc-9", mime_type="image/webp",
+                                        file_name="setup.webp")
+        )),
+        context,
+        _ai_settings(uploads),
+    ))
+
+    assert error == "" and path is not None
+    assert path.suffix == ".webp" and path.exists()
+    assert context.bot.requested == ["doc-9"]
+    assert not stale.exists(), "a crash-leftover upload must be swept up"

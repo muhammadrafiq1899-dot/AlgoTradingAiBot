@@ -98,6 +98,15 @@ def create_new_strategy(
             overwrite=False,
         )
     except (StrategyPluginError, CodeValidationError) as exc:
+        # A write that fails to load must not leave the file behind: the name
+        # would then be permanently unusable ("already exists") even after the
+        # author fixes the code. Only clean up when nothing is registered — a
+        # working plugin refuses the write before it reaches the filesystem.
+        if loader.get_class(name) is None:
+            try:
+                loader.path_for(name).unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - cleanup is best effort
+                log.warning("could not clean up failed strategy file %r", name)
         raise ValueError(f"cannot create strategy {name!r}: {exc}") from exc
 
     log.info("created strategy plugin %r", name)
@@ -149,14 +158,21 @@ def update_strategy_code(
 
 
 def promote_to_active(session: Session, strategy: Strategy) -> Strategy:
-    """Make `strategy` the single active version of its name.
+    """Make `strategy` THE active version — the only one.
 
-    Retires the current active version (if any) of the same name, then marks
-    `strategy` active and stamps `approved_at`. Returns the promoted row.
+    Retires every other active row, not just the same name's: the engine picks
+    the newest active row without filtering by name (`StrategyEngine.
+    get_active_strategy` orders by version), so leaving another strategy active
+    would silently keep it in charge of a freshly approved one. Stamps
+    `approved_at` and returns the promoted row.
     """
-    current = active_version(session, strategy.name)
-    if current is not None and current.id != strategy.id:
-        current.status = "retired"
+    others = session.execute(
+        select(Strategy).where(
+            Strategy.status == "active", Strategy.id != strategy.id
+        )
+    ).scalars().all()
+    for row in others:
+        row.status = "retired"
     if strategy.status != "active":
         strategy.status = "active"
         strategy.approved_at = strategy.approved_at or datetime.now(timezone.utc)

@@ -485,4 +485,26 @@ def approval_keyboard(recommendation_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+#: How the bot should read a batch of images. Mirrors the ``imgflow:<token>:<mode>``
+#: callback actions handled in ``telegram/commands.py``.
+IMAGE_FLOW_MODES = ("combine", "separate")
+
+
+def image_flow_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Choice buttons for a batch of images: one strategy, or one per image.
+
+    ``token`` identifies the buffered uploads (callback data is capped at 64
+    bytes, so paths cannot travel through it).
+    """
+    keyboard = [
+        [InlineKeyboardButton(
+            "🧩 One strategy from all",
+            callback_data=f"imgflow:{token}:combine")],
+        [InlineKeyboardButton(
+            "🧱 Separate strategies → ensemble",
+            callback_data=f"imgflow:{token}:separate")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 

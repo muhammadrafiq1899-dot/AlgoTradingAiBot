@@ -14,9 +14,15 @@ Why the invocation looks the way it does:
 * ``-t safe`` — the nested agent runs with Hermes' terminal-free toolset. The AI
   is advisory only (PROJECT_MAP invariant #3): it must never be able to run
   commands or edit files, which would bypass the human approval flow.
+* ``--image PATH`` — an attached image (a Telegram screenshot of a chart/strategy)
+  is handed to the nested agent as a real attachment. Hermes loads it natively
+  for the model and exposes its ``vision_analyze`` tool for that turn; that tool
+  is injected by the CLI for the attachment and is not a terminal/file tool, so
+  the advisory-only guarantee above is unchanged.
 * ``--ignore-rules`` — no AGENTS.md/memory/skill injection into a JSON-only reply.
-* ``--max-turns 1`` — the real tool loop (get_status/backtest/propose_change)
-  lives in ``algotrading/telegram/chat.py``; this call must answer, not act.
+* ``--max-turns 1`` (2 when an image is attached) — the real tool loop
+  (get_status/backtest/propose_change) lives in ``algotrading/telegram/chat.py``;
+  this call must answer, not act.
 * ``--source tool`` — keeps bot traffic out of the user's interactive session list.
 
 Errors surface as :class:`algotrading.ai.client.RecommendationError` (the same
@@ -27,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from typing import Any, Dict, List
@@ -38,6 +45,11 @@ log = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 120.0
 # Hermes toolset with no terminal/file access — see module docstring.
 SAFE_TOOLSET = "safe"
+# Turns allowed for one advisory call. An attached image costs one turn (the
+# nested agent calls vision_analyze before it can answer), so image calls get a
+# second one; without it the CLI exits non-zero on the exhausted budget.
+MAX_TURNS = 1
+IMAGE_MAX_TURNS = 2
 
 
 def _binary() -> str:
@@ -96,6 +108,42 @@ def parse_stream_json(stdout: str) -> str | None:
     return joined or None
 
 
+def salvage_partial_reply(answer: str) -> dict[str, Any] | None:
+    """Recover a reply object the model left mid-string.
+
+    Long answers occasionally arrive truncated (provider stream cut): the JSON
+    object is real but never closes. When the fragment is clearly a ``reply``
+    action with a partial ``"text"``, return what was written instead of throwing
+    the turn away. Anything else stays an error — guessing at tool arguments
+    would be worse than failing.
+    """
+    text = (answer or "").strip()
+    if not text.startswith("{"):
+        return None
+    marker = text.find('"text"')
+    if marker == -1:
+        return None
+    if not re.search(r'"action"\s*:\s*"reply"', text[:marker]):
+        return None
+
+    rest = text[marker + len('"text"'):].lstrip()
+    if not rest.startswith(":"):
+        return None
+    rest = rest[1:].lstrip()
+    if not rest.startswith('"'):
+        return None
+
+    partial = rest[1:]
+    # Drop a dangling escape or closing punctuation the model never finished.
+    partial = partial.rstrip()
+    while partial.endswith(("\\", '"', "}")):
+        partial = partial[:-1].rstrip()
+    partial = " ".join(partial.split())
+    if not partial:
+        return None
+    return {"action": "reply", "text": f"{partial} […]"}
+
+
 class HermesAgentClient:
     """AIClient-compatible client backed by the local ``hermes`` CLI."""
 
@@ -136,8 +184,13 @@ class HermesAgentClient:
         """True when the client is ready to use."""
         return self._enabled
 
-    def _command(self, prompt: str) -> list[str]:
-        """The full hermes invocation for one advisory call."""
+    def _command(self, prompt: str, image: str | None = None) -> list[str]:
+        """The full hermes invocation for one advisory call.
+
+        ``image`` is a local file path handed to the nested agent as an
+        attachment (``--image``). It stays inside the same terminal-free
+        invocation, so an image cannot escalate the agent's reach.
+        """
         cmd = [
             self._binary,
             "chat",
@@ -146,8 +199,10 @@ class HermesAgentClient:
             "-t", self._toolsets,
             "--source", "tool",
             "--ignore-rules",
-            "--max-turns", "1",
+            "--max-turns", str(IMAGE_MAX_TURNS if image else MAX_TURNS),
         ]
+        if image:
+            cmd += ["--image", str(image)]
         # Ask Hermes to wrap up before our own hard kill, so we get a reply
         # (and a parseable error) instead of a SIGKILL with no output.
         budget = int(self._timeout - 15)
@@ -156,25 +211,68 @@ class HermesAgentClient:
         return cmd
 
     def complete_json(
-        self, messages: List[Dict[str, str]], temperature: float | None = None
+        self, messages: List[Dict[str, str]], temperature: float | None = None,
+        image: str | None = None,
     ) -> Dict[str, Any]:
         """Run one query through Hermes and return the parsed JSON answer.
 
         Args:
             messages: OpenAI-style messages, flattened into a single prompt.
             temperature: unused, kept for AIClient API compatibility.
+            image: optional local image path attached to the query (``--image``).
 
         Raises:
             RecommendationError: the CLI is missing, times out, exits without an
-                answer, or the answer is not a JSON object.
+                answer, the answer is not a JSON object, or the image path is not
+                a readable file.
         """
         if not self.enabled:
             raise RecommendationError("Hermes CLI is not available or not enabled")
+        if image is not None and not os.path.isfile(image):
+            raise RecommendationError(f"image not found: {image}")
 
+        answer = self._ask(messages, image=image)
+        try:
+            return extract_json(answer)
+        except RecommendationError as exc:
+            salvaged = salvage_partial_reply(answer)
+            if salvaged is not None:
+                # Long answers are occasionally cut mid-string by the provider.
+                # A partial reply beats discarding the whole turn.
+                log.warning("Hermes Agent answer was truncated; salvaging the partial reply")
+                return salvaged
+            log.warning("Hermes Agent did not return JSON: %s", answer[:200])
+            raise RecommendationError(
+                f"Hermes Agent did not return JSON: {answer[:200]}"
+            ) from exc
+
+    def complete_text(
+        self, messages: List[Dict[str, str]], temperature: float | None = None,
+        image: str | None = None,
+    ) -> str:
+        """Run one query and return the answer text verbatim (no JSON required).
+
+        Use where an unstructured or partial answer is still useful — the
+        per-image transcription pass, whose long JSON answers sometimes arrive
+        truncated. Structured callers keep using :meth:`complete_json`.
+        """
+        if not self.enabled:
+            raise RecommendationError("Hermes CLI is not available or not enabled")
+        if image is not None and not os.path.isfile(image):
+            raise RecommendationError(f"image not found: {image}")
+        return self._ask(messages, image=image)
+
+    def _ask(self, messages: List[Dict[str, str]], image: str | None = None) -> str:
+        """Run the CLI once and return the text of its final answer event."""
         prompt = self._messages_to_prompt(messages)
+        if image:
+            prompt += (
+                "\n\n(An image is attached to this message: "
+                f"{os.path.basename(image)}. Look at it before answering.)"
+            )
         try:
             result = subprocess.run(
-                self._command(prompt),
+                self._command(prompt, image=image),
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
@@ -197,13 +295,7 @@ class HermesAgentClient:
                 f"Hermes CLI returned no answer (exit {result.returncode})"
                 + (f": {detail}" if detail else "")
             )
-        try:
-            return extract_json(answer)
-        except RecommendationError as exc:
-            log.warning("Hermes Agent did not return JSON: %s", answer[:200])
-            raise RecommendationError(
-                f"Hermes Agent did not return JSON: {answer[:200]}"
-            ) from exc
+        return answer
 
     def _messages_to_prompt(self, messages: List[Dict[str, str]]) -> str:
         """Flatten OpenAI-style messages into one prompt for ``hermes chat -q``."""

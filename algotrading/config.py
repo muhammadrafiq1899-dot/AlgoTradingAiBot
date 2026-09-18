@@ -58,6 +58,12 @@ class AIConfig(BaseModel):
     model: str = "gpt-4o-mini"
     temperature: float = 0.2
     max_recommendations_per_review: int = 1
+    # Image input (Telegram photo/document -> advisory LLM). Only the local
+    # Hermes Agent CLI can read images; the external API path replies with a
+    # "set USE_HERMES=true" hint instead.
+    images_enabled: bool = True
+    image_max_bytes: int = 5_000_000
+    image_dir: str = "data/uploads"   # repo-relative; resolved at load time
 
 
 class ApiConfig(BaseModel):
@@ -141,6 +147,11 @@ def load_settings(
     settings.db_path = str(Path(settings.data_dir) / "algotrading.db")
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.log_dir).mkdir(parents=True, exist_ok=True)
+
+    # Uploaded images land next to the runtime data, not in the CWD (Termux
+    # gotcha: the bot is started from wherever the supervisor happens to be).
+    ai_dir = Path(settings.ai.image_dir)
+    settings.ai.image_dir = str(ai_dir if ai_dir.is_absolute() else PROJECT_ROOT / ai_dir)
 
     # Strategy plugin dirs are relative to the project root, not the CWD, so the
     # bot finds them regardless of where it was launched from (Termux gotcha).
@@ -331,6 +342,8 @@ def validate_settings(settings: Settings) -> None:
             raise ValueError("ai.temperature must be in [0, 2]")
         if settings.ai.max_recommendations_per_review < 1:
             raise ValueError("ai.max_recommendations_per_review must be >= 1")
+        if settings.ai.image_max_bytes < 1:
+            raise ValueError("ai.image_max_bytes must be >= 1")
 
     # API config
     if settings.api.enabled:

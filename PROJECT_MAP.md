@@ -29,18 +29,22 @@ controlled from Telegram. Modular monolith, one Python process, one asyncio even
 - **Execution is a locked module:** the order gateway can only be a built-in module
   and cannot be disabled or replaced by config/external code (deterministic order path).
 - **Strategies are files:** user/AI-authored strategies live in `strategies/*.py`,
-  are AST-validated on load, and go live only after human approval.
+  are AST-validated on load, and go live only after human approval. They are
+  first-class ensemble components too, so several approved strategies can be
+  combined (`ensemble` mode consensus/any/filter/weighted) into one active strategy.
 - **Execution is deterministic Python; AI is advisory only** (proposals need human approval).
 - **Advisory LLM provider:** either an external OpenAI-compatible API (`AI_API_KEY`)
   or the **local Hermes Agent CLI** (`USE_HERMES=true`) — see `algotrading/hermes_ai/`.
   Either one sets `settings.ai.enabled`; the nested Hermes call runs with a
-  terminal-free toolset so it cannot act on the machine.
+  terminal-free toolset so it cannot act on the machine. The Hermes provider can
+  also **read images** (a Telegram photo/screenshot attached with `--image`); the
+  API-key provider cannot, and says so instead of ignoring the picture.
 - **Modes:** `paper` (simulated fills vs live prices, no keys) / `live` (real orders, requires keys).
 - **Data:** SQLite (WAL), event-sourced trade lifecycle (`order_events` is the source of truth).
 - **Stack constraints (Termux/Android):** no ccxt (pulls Rust `cryptography`), no `openai` SDK
   (pulls Rust `jiter`), pydantic **v1** only, pure-Python indicators (no numpy/pandas).
 - Version: `algotrading/__init__.py` → `__version__ = "0.1.0"`.
-- Tests: `pytest tests/` (185 passing, all M0–M7 milestones; includes a full non-technical-user scenario in `tests/test_scenario_end_to_end.py`).
+- Tests: `pytest tests/` (230 passing, all M0–M7 milestones; includes a full non-technical-user scenario in `tests/test_scenario_end_to_end.py`).
 
 ## 2. How to run
 
@@ -135,8 +139,15 @@ and `strategy_plugins_reload` from the strategy module.
 **Control surfaces (do NOT drive the pipeline):** Telegram commands (`/status`,
 `/strategy`, `/risk`, `/summary`, `/start_bot`, `/stop_bot`, inline ✅/❌ approval),
 plain-text **chat** (`telegram/chat.py`: the LLM orchestrator answers questions and
-can call `get_status` / `get_market` / `backtest` / `propose_change` tools), and the
-internal API (`/health`, `/status`). AI approval path:
+can call `get_status` / `get_market` / `backtest` / `propose_change` tools),
+**image chat** (Telegram photos are buffered per chat for `PHOTO_BATCH_DELAY_SECONDS`;
+one picture is answered immediately with the image attached, several at once get a
+choice keyboard — 🧩 *one strategy from all* (each image read by a vision pass, then
+ONE strategy written over the transcripts) or 🧱 *separate strategies → ensemble*
+(one agent call per image, follow-up points at the ensemble step) — handled by
+`commands.image_cmd` / `_flush_photo_batch` / `_run_image_flow` and the
+`imgflow:<token>:<mode>` callback; uploads are deleted once read), and the internal
+API (`/health`, `/status`). AI approval path:
 `ai_review` (daily) OR chat `propose_change` → `AIRecommendation(pending)` →
 human ✅ → `RecommendationStore.apply` → shadow `backtest.runner` →
 `store.strategy_versions.create_new_version` + `promote_to_active` (retires old
@@ -151,7 +162,7 @@ Telegram bot runs in the event loop with one session.
 | Path | Purpose | Key symbols |
 |---|---|---|
 | `algotrading/main.py` | Entry point, module composition, lifecycle | `parse_args`, `build_context` → `(BotContext, ModuleManager)`, `AppController`, `run`, `main` (shutdown waits for in-flight scheduler jobs) |
-| `algotrading/config.py` | YAML + .env → validated settings | `Settings`, `RiskConfig`, `MarketConfig`, `ScheduleConfig`, `AIConfig`, `ApiConfig`, `LogConfig`, `ModulesConfig`, `load_settings` (cached), `validate_settings`, `get_secret`, `load_strategy_definitions` |
+| `algotrading/config.py` | YAML + .env → validated settings | `Settings`, `RiskConfig`, `MarketConfig`, `ScheduleConfig`, `AIConfig` (incl. `images_enabled`, `image_max_bytes`, `image_dir` — resolved to an absolute path), `ApiConfig`, `LogConfig`, `ModulesConfig`, `load_settings` (cached), `validate_settings`, `get_secret`, `load_strategy_definitions` |
 | `algotrading/modules/base.py` | Module contract, capabilities, execution lock | `Module`, `ModuleSpec`, `ServiceBag`, `CAPABILITY_MARKET/EXECUTION/STRATEGY/ANALYTICS/CONTROL/API/SCHEDULER_CONTROL`, `LOCKED_CAPABILITIES`, `BUILD_ORDER`, `sort_modules`, `ModuleError` |
 | `algotrading/modules/registry.py` | Name → class + config-driven resolution | `register_module`, `get_module`, `all_modules`, `module_names`, `load_external_modules`, `default_enabled_names`, `resolve_modules`, `ModuleSpec` |
 | `algotrading/modules/manager.py` | Module lifecycle (setup/start/stop) + job collection | `ModuleManager` (`resolve`, `setup`, `start`, `stop`, `collect_jobs`, `describe`), `build_manager` |
@@ -173,9 +184,9 @@ Telegram bot runs in the event loop with one session.
 | `algotrading/market/candles.py` | Persist/query candles, backfill | `CandleStore` (upsert/get/latest_ts/prune), `backfill` |
 | `algotrading/strategy/base.py` | Strategy protocol + signal model | `Signal`, `Strategy` (stateless, pure) |
 | `algotrading/strategy/indicators.py` | Pure-Python TA (no numpy) + indicator registry | `sma`, `ema`, `rsi`, `atr`, `bollinger_bands`, `macd`, `supertrend`, `vwap`, `closes/highs/lows`, `last_valid`, `register_indicator`, `create_indicator` |
-| `algotrading/strategy/validation.py` | One safety gate for AI/user-authored code | `validate_strategy_code`, `validate_indicator_code`, `compile_strategy`, `compile_indicator`, `safe_namespace`, `CodeValidationError` |
+| `algotrading/strategy/validation.py` | One safety gate for AI/user-authored code | `validate_strategy_code`, `validate_indicator_code`, `compile_strategy` (also probes the constructor — see below), `compile_indicator`, `safe_namespace`, `_safe_import`, `CodeValidationError`. Imports allowed: the indicator helpers, `math`, `statistics` — `from algotrading.strategy import indicators as ta`, bare `from indicators import ...`, `import math`; `_import_allowed` is the single rule read by both the AST check and the runtime import hook, and sibling access (`from algotrading.strategy import registry`) is refused. `_check_constructor` rejects a class that cannot be built as `cls(params_dict)` |
 | `algotrading/strategy/plugins.py` | Load/write/hot-reload strategy files on disk | `StrategyPluginLoader`, `StrategyPlugin`, `StrategyPluginError`, `get_default_loader`, `configure_default_loader`, `DEFAULT_PLUGIN_DIR` |
-| `algotrading/strategy/starters.py` | The built-in strategies (8 total) | `EMACrossover`, `RSIMeanReversion`, `BBMeanReversion`, `MACDTrend`, `SuperTrendStrategy`, `VWAPReclaim`, `MultiTFEMA`, `EnsembleStrategy`, `STRATEGIES` registry dict |
+| `algotrading/strategy/starters.py` | The built-in strategies (8 total) | `EMACrossover`, `RSIMeanReversion`, `BBMeanReversion`, `MACDTrend`, `SuperTrendStrategy`, `VWAPReclaim`, `MultiTFEMA`, `EnsembleStrategy` (components resolved through the registry via `_build_component`, so AI-authored plugin strategies combine too; note `consensus` = "no firing component disagrees"), `STRATEGIES` registry dict |
 | `algotrading/strategy/registry.py` | Name → class lookup (built-ins + plugins) | `build_strategy`, `known_names`, `builtin_names`, `plugin_names`, `is_builtin`, `is_plugin`, `reload_plugins`, `UnknownStrategyError` |
 | `algotrading/strategy/catalog.py` | Live strategy catalog (schemas + ranges) for prompts/UI | `catalog_entries`, `default_params`, `StrategyEntry`, `ParamSpec` (`range_text`, `compact`), `BUILTIN`/`PLUGIN` |
 | `algotrading/strategy/engine.py` | Evaluate snapshot → persisted signals with optional hot-reload | `StrategyEngine` (`evaluate`, `get_active_strategy`, `_maybe_reload_strategy`, duplicate guard) |
@@ -188,16 +199,16 @@ Telegram bot runs in the event loop with one session.
 | `algotrading/analytics/metrics.py` | Pure metric math | `compute_metrics`, `Metrics`, loss tags |
 | `algotrading/analytics/service.py` | Snapshot metrics into `analytics_summaries` | `AnalyticsService.run`, `run_daily` |
 | `algotrading/ai/client.py` | OpenAI-compatible chat client (requests) | `AIClient.complete_json`, `extract_json`, `RecommendationError` |
-| `algotrading/hermes_ai/client.py` | Advisory LLM via the local Hermes Agent CLI (`USE_HERMES=true`); prompts ship as `-q` args in a terminal-free, rule-free invocation | `HermesAgentClient` (`complete_json`, `enabled`), `parse_stream_json` (reads the `stream-json` `result` event — plain output echoes the query, so a naive text parse returns the *prompt's* JSON), `SAFE_TOOLSET`, env knobs `HERMES_CLI`/`HERMES_TOOLSETS`/`HERMES_TIMEOUT` |
+| `algotrading/hermes_ai/client.py` | Advisory LLM via the local Hermes Agent CLI (`USE_HERMES=true`); prompts ship as `-q` args in a terminal-free, rule-free invocation | `HermesAgentClient` (`complete_json(messages, image=None)`, `complete_text` — verbatim answer, no JSON requirement, for the per-image transcription pass; `enabled`), `parse_stream_json` (reads the `stream-json` `result` event — plain output echoes the query, so a naive text parse returns the *prompt's* JSON), `salvage_partial_reply` (a provider-cut answer that is clearly a `reply` still yields its partial text; truncated tool calls stay errors), `_ask`/`_command(prompt, image=...)` (`--image PATH`, `--max-turns 2` when an image is attached so the CLI-injected `vision_analyze` turn fits), `SAFE_TOOLSET`, `MAX_TURNS`/`IMAGE_MAX_TURNS`, env knobs `HERMES_CLI`/`HERMES_TOOLSETS`/`HERMES_TIMEOUT` |
 | `algotrading/hermes_ai/__init__.py` | Package export | `HermesAgentClient`, `parse_stream_json` |
 | `algotrading/ai/prompt_builder.py` | Deterministic prompt from local data | `build_prompt`, `build_feature_window` |
-| `algotrading/ai/assistant.py` | LLM → validated PENDING recommendation (client chosen from `settings.ai`: Hermes Agent or external API) | `Assistant.propose`, `_validate` |
-| `algotrading/store/recommendations.py` | Recommendation CRUD + human apply + pending creation | `RecommendationStore` (`pending`, `mark_rejected`, `apply`, `_shadow_backtest`), `create_pending_recommendation`, `allowed_strategy_names`, `ALLOWED_KINDS` (incl. `new_strategy` / `edit_strategy` / `new_indicator`); `apply` authors `new_strategy`/`edit_strategy` code *before* the shadow backtest (the name doesn't resolve otherwise) and skips it for `new_indicator` (a function, not a strategy) |
-| `algotrading/store/strategy_versions.py` | Controlled single-active release + strategy file writes | `latest_version`, `create_new_version`, `create_new_strategy`, `update_strategy_code`, `promote_to_active` |
+| `algotrading/ai/assistant.py` | LLM → validated PENDING recommendation (client chosen from `settings.ai`: Hermes Agent or external API) | `Assistant.propose`, `_validate`, `_validate_ast` (runs the same `compile_strategy` gate, so the daily review can't file a proposal that fails to build) |
+| `algotrading/store/recommendations.py` | Recommendation CRUD + human apply + pending creation | `RecommendationStore` (`pending`, `mark_rejected`, `apply`, `_shadow_backtest`), `create_pending_recommendation`, `allowed_strategy_names`, `ALLOWED_KINDS` (incl. `new_strategy` / `edit_strategy` / `new_indicator`); `create_pending_recommendation` runs the full `compile_strategy` gate on authored templates *before* a PENDING row exists (bad code comes back to the model as tool feedback instead of a dead Approve); `apply` authors `new_strategy`/`edit_strategy` code *before* the shadow backtest (the name doesn't resolve otherwise) and skips it for `new_indicator` (a function, not a strategy) |
+| `algotrading/store/strategy_versions.py` | Controlled single-active release + strategy file writes | `latest_version`, `active_version`, `create_new_version`, `create_new_strategy` (removes the file when the write fails to load, so the name isn't poisoned), `update_strategy_code`, `promote_to_active` (retires every other active row — exactly one active strategy overall) |
 | `algotrading/telegram/bot.py` | PTB Application bootstrap + factories | `build_application`, `_make_approve`, `_make_reject`, `_make_backtest` (current vs default comparison, via `_current_params`), `_make_catalog_scores` (ranked scores, cached, threaded), `_stored_candles`, `run_bot` |
-| `algotrading/telegram/commands.py` | Command handlers + allowlist auth + rate limiting + chat handler wiring | `build_handlers` (`on_start/on_stop/on_approve/on_reject/on_backtest/on_catalog_scores`), `_auth_decorator`, `_rate_limited`, `reset_rate_limits`, `on_callback` (`approve:`/`reject:`/`bt:`); commands: `/help`, `/status`, `/strategies` (ranked catalog + backtest buttons), `/strategy`, `/risk`, `/summary`, `/start_bot`, `/stop_bot` |
-| `algotrading/telegram/chat.py` | LLM orchestrator (plain-text chat): tool-using agent | `run_agent`, `tool_get_status/get_market/backtest/propose_change`, `CHAT_SYSTEM_PROMPT`, `strategy_catalog` (delegates to `strategy/catalog.py`), `build_system_prompt` |
-| `algotrading/telegram/ui.py` | Formatting + inline keyboards | `format_status/risk/strategies/summary` (`format_risk` shows the trailing-stop setting), `format_strategy_catalog` (HTML, truncated to Telegram's cap; optional score/rank labels), `rank_by_score` (best-first, unscored last), `format_backtest_comparison` (side-by-side `<pre>` tables + risk-adjusted verdict), `_risk_adjusted` = PnL ÷ max drawdown, `approval_keyboard`, `backtest_keyboard` (`bt:<name>`, 64-byte-safe, capped) |
+| `algotrading/telegram/commands.py` | Command handlers + allowlist auth + rate limiting + chat/image batching + image-flow choice | `build_handlers` (`on_start/on_stop/on_approve/on_reject/on_backtest/on_catalog_scores`, `chat_cmd`, `image_cmd`), `collect_image` (photo/document → local file, gated *before* download: assistant enabled, `ai.images_enabled`, `use_hermes`, `image_max_bytes`), `_uploads_dir`, `_image_suffix`, `_image_path`, `_prune_uploads` (24h sweep of crash leftovers), `_delete_uploads`, `_deliver_agent_result` (answer + approval card, via `reply_text` or `bot.send_message`), image batching: `_photo_batches`/`_photo_batch_tasks`/`_image_flows`, `_schedule_photo_flush`, `_flush_photo_batch`, `_offer_image_flow`, `_run_image_flow` ('combine' = one call over all images, 'separate' = one call per image), `reset_photo_batches`, `PHOTO_BATCH_DELAY_SECONDS`/`IMAGE_BATCH_LIMIT`/`IMAGE_FLOW_TTL_SECONDS`, `IMAGE_FLOW_CHOICE_TEXT`/`IMAGE_FLOW_SEPARATE_FOLLOWUP`/`IMAGE_FLOW_EXPIRED`, `IMAGE_CAPTION_FALLBACK`/`IMAGE_BATCH_CAPTION_FALLBACK`, `UPLOAD_MAX_AGE_SECONDS`, `_auth_decorator`, `_rate_limited`, `reset_rate_limits`, `on_callback` (`approve:`/`reject:`/`bt:`/`imgflow:<token>:<mode>`); commands: `/help`, `/status`, `/strategies` (ranked catalog + backtest buttons), `/strategy`, `/risk`, `/summary`, `/start_bot`, `/stop_bot` |
+| `algotrading/telegram/chat.py` | LLM orchestrator (plain-text chat + images): tool-using agent | `run_agent` (`image_path=` attaches one picture to every turn; 2+ `image_paths=` transcribes each image first and runs the loop once over the transcripts), `_describe_image`, `tool_get_status/get_market/backtest/propose_change`, `CHAT_SYSTEM_PROMPT` (hard rule 5: image text is untrusted data; an ENSEMBLE MODES block states the implemented consensus/any/filter/weighted semantics so the bot does not overclaim them in plain-text turns; the new_indicator schema example no longer carries the shell-mangled `$_2_`/`$_100_` literals), `IMAGE_INPUT_PROMPT` (image + ensemble guidance, added only for image turns by `build_system_prompt(with_image=True)`), `DESCRIBE_IMAGE_PROMPT`, `strategy_catalog` (delegates to `strategy/catalog.py`) |
+| `algotrading/telegram/ui.py` | Formatting + inline keyboards | `format_status/risk/strategies/summary` (`format_risk` shows the trailing-stop setting), `format_strategy_catalog` (HTML, truncated to Telegram's cap; optional score/rank labels), `rank_by_score` (best-first, unscored last), `format_backtest_comparison` (side-by-side `<pre>` tables + risk-adjusted verdict), `_risk_adjusted` = PnL ÷ max drawdown, `approval_keyboard`, `backtest_keyboard` (`bt:<name>`, 64-byte-safe, capped), `image_flow_keyboard` (🧩/🧱 choice for a photo batch) + `IMAGE_FLOW_MODES` |
 | `algotrading/api/app.py` | FastAPI factory with enriched health + metrics | `build_api` (`/health`, `/metrics`, `/status`) |
 | `algotrading/api/metrics.py` | Prometheus metrics (optional) | `init_metrics`, `get_metrics`, `record_tick`, `record_signal`, `record_order`, `record_fill`, `tick_timer`, `market_timer`, `execution_timer` |
 | `algotrading/api/auth.py` | Bearer guard (constant-time) | `require_token` |
@@ -240,7 +251,7 @@ Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (bump + add mig
 | Run headless (no Telegram) | `--no-telegram`, or `modules.disabled: [control.telegram]` |
 | Load a third-party module | `modules.external: ["pkg.mod:MyModule"]` (locked capabilities are refused) |
 | Add a new strategy (built-in) | `strategy/starters.py` (class + register in `STRATEGIES`) → `config/strategies.yaml` (schema) → tests: `test_indicators.py`, `test_backtest.py` |
-| Add a strategy as a file (user/AI) | `strategies/<name>.py` (convention in `strategies/README.md`); validated by `strategy/validation.py`, loaded by `strategy/plugins.py` |
+| Add a strategy as a file (user/AI) | `strategies/<name>.py` (convention in `strategies/README.md`); validated by `strategy/validation.py`, loaded by `strategy/plugins.py`. Contract: `def __init__(self, params=None)` (built as `cls(params_dict)`) and only the indicator/`math`/`statistics` imports |
 | Let the AI create / edit a strategy | `new_strategy` / `edit_strategy` recommendation kinds → human ✅ → `store/strategy_versions.py` writes the plugin file + a new version |
 | Change what code safety allows | `strategy/validation.py` (single gate for AI/user code; used by plugins, recommendations, indicators) |
 | **Built-in strategies** (ready to use) | `ema_crossover`, `rsi_mean_reversion`, `bb_mean_reversion`, `macd_trend`, `supertrend`, `vwap_reclaim`, `multi_tf_ema`, `ensemble` |
@@ -254,6 +265,8 @@ Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (bump + add mig
 | Add an API endpoint | `api/app.py` `build_api` (+ `require_token` for anything sensitive) |
 | New AI recommendation kind | `store/recommendations.py` `ALLOWED_KINDS` → `ai/assistant.py` + `telegram/chat.py` prompts → `apply` → approval flow |
 | Chat with the bot in natural language | `telegram/chat.py` (`run_agent` + tools); handler wired in `telegram/commands.py`; requires the assistant to be enabled (`AI_API_KEY` **or** `USE_HERMES=true`) |
+| Send a screenshot/image and have the AI read it | `telegram/commands.py` `image_cmd` → `collect_image` (photo/document → `data/uploads/`, deleted after the call). One picture: `chat.run_agent(image_path=...)` → `hermes_ai/client.py` `--image` (`--max-turns 2`). Several at once: buffered (`PHOTO_BATCH_DELAY_SECONDS`), then a 🧩/🧱 choice keyboard (`image_flow_keyboard`, `imgflow:<token>:<mode>`) — 🧩 `image_paths=` transcribes each image and writes ONE strategy, 🧱 one call per image then the ensemble step. Hermes provider only, sizes capped by `ai.image_max_bytes`; tune wording in `IMAGE_INPUT_PROMPT`/`DESCRIBE_IMAGE_PROMPT` |
+| Combine several strategies into one (ensemble) | `strategy/starters.py` `EnsembleStrategy` (components via `_build_component` → registry, so AI-authored plugins qualify) + `store/recommendations.py` `ensemble_strategy`/`filter_strategy` kinds; the chat drafts it from the catalog once the components are approved and active |
 | Run the advisory AI with no API key (local Hermes Agent) | `.env` `USE_HERMES=true` (sets `ai.enabled` in `config.py` `load_settings`) → `algotrading/hermes_ai/client.py` shells out to `hermes chat -q --format stream-json -t safe`; picked up by `telegram/chat.py` `run_agent` and `scheduler/jobs.py` `ai_review` |
 | Add a DB table / column | `db/models.py` + bump `SCHEMA_VERSION` in `db/__init__.py` |
 | Add a Binance endpoint | `market/binance_rest.py` (public vs signed helpers) |
@@ -306,6 +319,19 @@ with correlation IDs (request/trace tracking). JSON fields configurable via
 | "AI assistant is not configured" even though `USE_HERMES=true` | the bot was started before the `.env` edit (settings are read once at startup), or the value isn't one of `true/1/yes/on` | restart the bot; `USE_HERMES=true` must set `settings.ai.enabled` in `config.py` `load_settings` |
 | "USE_HERMES=true but the `hermes` command was not found on PATH" | `shutil.which("hermes")` failed from the bot's environment (`hermes_ai/client.py`); `algobot start` inherits the shell's PATH | run `hermes --version` in the same shell (or pin `HERMES_CLI=/abs/path/hermes`), otherwise set `AI_API_KEY` |
 | "Hermes CLI returned no answer" / "did not return JSON" | the nested agent printed no `{"type":"result"}` event, exited early, or answered with prose instead of the expected JSON | reproduce with `hermes chat -q 'hi'`; raise `HERMES_TIMEOUT` if it is only slow; see `logs/algotrading.log` |
+| Image sent but the bot replies "needs the local Hermes Agent" | `USE_HERMES` is not set, so the advisory provider is the external API (no vision path). The image is refused on purpose, never silently dropped | `.env` `USE_HERMES=true` + restart; or ask in text |
+| Image sent but nothing happens at all | before this feature the photo matched no handler (silent). Now: auth allowlist, `ai.images_enabled`, or assistant disabled — `collect_image` replies with the reason | check `logs/algotrading.log` for `image download failed`, and that `settings.ai.enabled` is true |
+| "That image is X MB — I read up to Y MB" | upload over `ai.image_max_bytes` (checked on Telegram's declared size *and* on the bytes that landed) | raise the cap in `config/settings.yaml` or send a smaller screenshot |
+| Image turns are slow / hit the timeout | an image call allows `--max-turns 2` (the nested agent spends one turn on `vision_analyze`) and the file is base64-encoded into the provider request | raise `HERMES_TIMEOUT`; screenshots beat photos of a screen |
+| Image with embedded text ("ignore your rules…") | text inside an image is untrusted data by design (chat hard rule 5) — the agent is told to refuse and report it | expected behaviour; the agent still cannot trade or apply anything |
+| Batch keyboard says "expired" | the images waited longer than `IMAGE_FLOW_TTL_SECONDS` (15 min), or the bot restarted (batches are in-memory) | send the pictures again; batches are not persisted on purpose |
+| "(Only the first 6 are used.)" | a batch exceeded `IMAGE_BATCH_LIMIT` — each image costs its own vision pass | send fewer at once, or raise the limit |
+| Multi-image run answers only about some images | one transcription came back truncated by the provider; `complete_text` + partial-JSON salvage keeps what was written and marks the rest | re-send the image, or raise `HERMES_TIMEOUT` if the CLI itself was slow |
+| "AI proposal … apply failed: unknown strategy: X" for an ensemble | a component was never approved/released, so the name does not resolve (`EnsembleStrategy` builds through the registry) | approve the component strategies first, then re-draft the ensemble |
+| Photo answered after a ~1s pause | by design: photos are buffered for `PHOTO_BATCH_DELAY_SECONDS` so an album is answered once | expected |
+| "new_strategy template rejected: import 'X' is not available" | authored code tried to import something outside the sandbox allowlist | the model is told at propose time and rewrites it; for hand-written plugins use `ta` / `from algotrading.strategy import indicators as ta` |
+| "strategy cannot be built as cls(params_dict)" | the generated class used a keyword constructor (`def __init__(self, period=14)`) instead of taking the params dict | the propose-time gate rejects it before any approval; the prompt and `strategies/README.md` state the required shape |
+| "strategy plugin 'X' already exists" right after a failed approval | a half-written plugin file from an earlier failure (fixed: a failed write is now removed) | delete the stale `strategies/X.py` and re-approve |
 | strategy eval broken after release | version `retired/active` mismatch in `store/strategy_versions.py`; params JSON invalid → engine logs "Cannot build active strategy" |
 | `No module named algotrading/main` | bot started from wrong directory (see §2) |
 | schema/migration issues | `SCHEMA_VERSION` + `meta` table; derived tables are rebuilt from `order_events`, never hand-edit |
@@ -326,15 +352,15 @@ deterministic fix.
 | `test_analytics.py` | metric math + summary persistence |
 | `test_ai.py` | AI client parsing + prompt determinism |
 | `test_m6c.py` | recommendation store + apply, assistant validation, versioned release |
-| `test_telegram.py` | allowlist auth, /status formatting, approval flow, /strategies catalog (built-ins + plugins, truncation, risk-adjusted ranking) and its `bt:` backtest buttons (current-vs-default comparison, verdict) |
-| `test_chat.py` | LLM chat orchestrator: tools (backtest/propose_change), safety contract |
-| `test_hermes_ai.py` | Hermes Agent provider: `stream-json` result-event parsing (must not return the echoed prompt's JSON), terminal-free toolset invocation, `USE_HERMES` enabling the assistant with no `AI_API_KEY`, chat gating when the CLI is missing |
+| `test_telegram.py` | allowlist auth, /status formatting, approval flow, /strategies catalog (built-ins + plugins, truncation, risk-adjusted ranking) and its `bt:` backtest buttons (current-vs-default comparison, verdict), image input (photo routing via a real PTB `Update`, single photo answered + upload deleted, caption fallback, proposal card, photo burst → one 🧩/🧱 choice, both flows through the `imgflow` callback, batch cap, expired token, gating order, non-image documents, stale-upload sweep) |
+| `test_chat.py` | LLM chat orchestrator: tools (backtest/propose_change), safety contract, image turns (attachment on every turn, image-only prompt block) |
+| `test_hermes_ai.py` | Hermes Agent provider: `stream-json` result-event parsing (must not return the echoed prompt's JSON), terminal-free toolset invocation, `USE_HERMES` enabling the assistant with no `AI_API_KEY`, chat gating when the CLI is missing, image attachment (`--image`, `--max-turns 2`, text turns unchanged, missing file refused before the CLI runs), truncated answers (`salvage_partial_reply`: partial reply kept, partial tool call still an error), verbatim `complete_text` for transcription |
 | `test_api.py` | /health open, /status bearer-guarded |
 | `test_live_gateway.py` | live gateway + supervisor units |
 | `test_backtest.py` | shadow backtest replay + equity summary |
 | `test_ema_percentage_strategy.py` | EMA + percentage-threshold strategy signals |
 | `test_modules.py` | module resolution, external loading, lifecycle, job contribution, execution lock |
-| `test_strategy_plugins.py` | plugin load/write/edit, code-safety rejection, hot-reload, AI authoring flow |
+| `test_strategy_plugins.py` | plugin load/write/edit, code-safety rejection (including the import allowlist: documented form works, bare `indicators` is aliased, siblings/os are refused), constructor shape (`cls(params_dict)` probe), propose-time gate for uncompilable code, failed-write cleanup, hot-reload, AI authoring flow, ensemble components: an AI-authored plugin combines (and an unknown name still fails) |
 | `test_scenario_end_to_end.py` | **Full non-technical-user scenario**: setup wizard, module composition, a real entry + trailing-stop exit (regression: protective exits run with no candidates, NULL `highest_price`, `CandleStore.latest` never existed), every Telegram command + backtest button + approve/reject, chat-driven `new_strategy` approval, analytics, API, restart rebuild |
 
 ## 10. Keeping this map in sync (git hook / CI)
@@ -365,8 +391,10 @@ deterministic fix.
 
 1. **Intent-before-order:** persist `trade_intent` w/ unique `idempotency_key` before any order; retries reuse it.
 2. **Event-sourced ledger:** `order_events` immutable; positions/trades are derived views.
-3. **AI advisory only:** proposals PENDING until human approval; AI never touches exchange or active strategy. This includes chat: the LLM orchestrator (`telegram/chat.py`) can read state, research, and backtest, but the only way it can change anything is `propose_change` (PENDING). When the provider is the local Hermes Agent, the nested call runs terminal-free (`hermes chat -q --format stream-json -t safe --ignore-rules`), so the agent cannot run commands or edit files either.
-4. **One active strategy version** at a time (`store/strategy_versions.py`).
+3. **AI advisory only:** proposals PENDING until human approval; AI never touches exchange or active strategy. This includes chat: the LLM orchestrator (`telegram/chat.py`) can read state, research, and backtest, but the only way it can change anything is `propose_change` (PENDING). When the provider is the local Hermes Agent, the nested call runs terminal-free (`hermes chat -q --format stream-json -t safe --ignore-rules`), so the agent cannot run commands or edit files either. An attached image does not change this: `--image` adds a picture to the same terminal-free call (the CLI injects its `vision_analyze` tool for the attachment only), and text *inside* an image is untrusted data the agent is told to refuse as instructions.
+4. **One active strategy version** at a time (`store/strategy_versions.py`): `promote_to_active` retires EVERY other active row, not just the same name's, because `StrategyEngine.get_active_strategy` orders by version without filtering by name — otherwise a fresh approval could silently not take over.
+   An ensemble is a version too: approving `ensemble_strategy` makes the ensemble the
+   active strategy, and its components must already exist (approved plugins included).
 5. **Stale-data freeze:** no new entries when candles too old (protective exits only).
 6. **Live requires keys + explicit mode;** bot refuses to start otherwise.
 7. **Thread-safety:** each job/thread opens its own DB session.

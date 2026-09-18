@@ -21,6 +21,7 @@ from algotrading.backtest.runner import BacktestResult, run_backtest
 from algotrading.db.models import AIRecommendation, Strategy
 from algotrading.market.base import Candle
 from algotrading.strategy.registry import is_plugin, known_names
+from algotrading.strategy.validation import CodeValidationError, compile_strategy
 from algotrading.store.strategy_versions import (
     create_new_version,
     create_new_strategy,
@@ -104,6 +105,15 @@ def create_pending_recommendation(
         # Basic validation - more comprehensive validation happens in apply()
         if "def evaluate" not in template and "class" not in template:
             raise ValueError("new_strategy template must define a strategy class with evaluate method")
+
+        # Full safety gate now, not at approval time: a template that cannot be
+        # compiled and built (bad import, missing evaluate, wrong constructor
+        # shape) must come back to the model as tool feedback while it can still
+        # fix it — never as a broken Approve.
+        try:
+            compile_strategy(template, strategy_name)
+        except CodeValidationError as exc:
+            raise ValueError(f"new_strategy template rejected: {exc}") from exc
         
         if indicator_deps is None:
             indicator_deps = []
@@ -140,6 +150,10 @@ def create_pending_recommendation(
             raise ValueError("edit_strategy requires 'template' string with Python code")
         if "def evaluate" not in template and "class" not in template:
             raise ValueError("edit_strategy template must define a strategy class with evaluate method")
+        try:
+            compile_strategy(template, strategy_name)
+        except CodeValidationError as exc:
+            raise ValueError(f"edit_strategy template rejected: {exc}") from exc
         if not isinstance(params, dict):
             raise ValueError("params must be a dict")
         

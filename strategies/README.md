@@ -55,8 +55,13 @@ STRATEGY_INDICATORS = ["sma"]
 ## Rules
 
 - The class must define `evaluate(self, symbol, candles)`.
-- Imports of `os`, `sys`, `socket`, `subprocess`, `requests`, ... are rejected,
-  as are `eval` / `exec` / `open` / `__import__`.
+- The constructor must take the parameter dict: `def __init__(self, params=None)`.
+  The engine builds strategies as `cls(params_dict)`, so keyword-style
+  constructors (`def __init__(self, period=14)`) are rejected at validation.
+- Imports are limited to the indicator helpers, `math` and `statistics`
+  (`from algotrading.strategy import indicators as ta`, `from indicators import
+  sma`, `import math`). Imports of `os`, `sys`, `socket`, `subprocess`,
+  `requests`, ... are rejected, as are `eval` / `exec` / `open` / `__import__`.
 - Names of built-in strategies (`ema_crossover`, `ensemble`, ...) cannot be
   reused here. Edit built-ins through a parameter change instead.
 - A new strategy only goes live after a human approves the AI's proposal

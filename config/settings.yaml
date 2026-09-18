@@ -46,6 +46,9 @@ ai:
   model: gpt-4o-mini
   temperature: 0.2
   max_recommendations_per_review: 1
+  images_enabled: true    # accept Telegram photos/screenshots (needs USE_HERMES=true)
+  image_max_bytes: 5000000  # reject larger uploads (phone storage + provider limits)
+  image_dir: data/uploads # repo-relative; files are deleted right after the AI reads them
 
 # --- Internal HTTP API (optional health/status; requires API_TOKEN in .env) ---
 api:

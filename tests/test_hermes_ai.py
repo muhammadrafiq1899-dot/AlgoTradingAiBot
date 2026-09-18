@@ -14,7 +14,7 @@ import pytest
 from algotrading.ai.client import RecommendationError
 from algotrading.config import AIConfig, Settings, load_settings, validate_settings
 from algotrading.db import get_session_factory, init_db
-from algotrading.hermes_ai.client import HermesAgentClient, parse_stream_json
+from algotrading.hermes_ai.client import HermesAgentClient, parse_stream_json, salvage_partial_reply
 from algotrading.telegram import chat as chat_mod
 from algotrading.telegram.chat import run_agent
 
@@ -169,8 +169,10 @@ class StubHermes:
         StubHermes.last = self
         self._response = response
         self.enabled = enabled
+        self.image_kwargs = []
 
-    def complete_json(self, messages, temperature=None):
+    def complete_json(self, messages, temperature=None, **kwargs):
+        self.image_kwargs.append(kwargs)
         if self._response is None:
             raise RecommendationError("Hermes CLI is not available or not enabled")
         return self._response
@@ -201,3 +203,162 @@ def test_run_agent_reports_unconfigured_when_no_provider(session_factory):
     settings = Settings(ai=AIConfig(enabled=False, use_hermes=False))
     result = run_agent(session_factory, settings, "hi")
     assert "not configured" in result["text"]
+
+
+# --- image input ------------------------------------------------------------
+
+def _chart(tmp_path):
+    """A real file on disk: the client refuses anything that is not one."""
+    path = tmp_path / "chart.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+    return path
+
+
+def test_image_call_attaches_it_and_raises_the_turn_budget(cli_ok, monkeypatch, tmp_path):
+    image = _chart(tmp_path)
+    run = cli_ok(_result_event('{"action":"reply","text":"seen"}'))
+    monkeypatch.setattr("subprocess.run", run)
+
+    out = HermesAgentClient().complete_json(
+        [{"role": "user", "content": "what is this?"}], image=str(image)
+    )
+
+    assert out == {"action": "reply", "text": "seen"}
+    cmd = run.calls[-1]
+    assert cmd[cmd.index("--image") + 1] == str(image)
+    # Reading an image costs a turn (vision_analyze), so the budget grows by one.
+    assert cmd[cmd.index("--max-turns") + 1] == "2"
+    # ...and the advisory-only guarantee is untouched: same terminal-free toolset.
+    assert cmd[cmd.index("-t") + 1] == "safe"
+    assert "--ignore-rules" in cmd
+    prompt = cmd[cmd.index("-q") + 1]
+    assert "what is this?" in prompt
+    assert "image is attached" in prompt.lower()
+
+
+def test_text_only_call_keeps_the_old_invocation(cli_ok, monkeypatch):
+    run = cli_ok(_result_event('{"action":"reply","text":"ok"}'))
+    monkeypatch.setattr("subprocess.run", run)
+    HermesAgentClient().complete_json([{"role": "user", "content": "hi"}])
+
+    cmd = run.calls[-1]
+    assert "--image" not in cmd
+    assert cmd[cmd.index("--max-turns") + 1] == "1"
+
+
+def test_missing_image_is_refused_before_the_cli_runs(cli_ok, monkeypatch, tmp_path):
+    run = cli_ok(_result_event('{"action":"reply"}'))
+    monkeypatch.setattr("subprocess.run", run)
+
+    with pytest.raises(RecommendationError, match="image not found"):
+        HermesAgentClient().complete_json(
+            [{"role": "user", "content": "x"}], image=str(tmp_path / "nope.png")
+        )
+    assert run.calls == []
+
+
+def test_run_agent_attaches_the_image_for_the_hermes_provider(
+    session_factory, monkeypatch, tmp_path
+):
+    image = _chart(tmp_path)
+    monkeypatch.setattr(chat_mod, "HERMES_AI_AVAILABLE", True)
+    monkeypatch.setattr(
+        chat_mod, "HermesAgentClient",
+        lambda *a, **k: StubHermes({"action": "reply", "text": "seen"}),
+    )
+    result = run_agent(session_factory, _hermes_settings(), "what is this?",
+                       image_path=str(image))
+
+    assert result["text"] == "seen"
+    assert StubHermes.last.image_kwargs == [{"image": str(image)}]
+
+
+def test_run_agent_refuses_images_without_the_hermes_provider(session_factory, tmp_path):
+    # API-key provider: no vision path, so the image is refused with a hint
+    # rather than silently dropped.
+    image = _chart(tmp_path)
+    settings = Settings(ai=AIConfig(enabled=True, api_key="k"))
+    result = run_agent(session_factory, settings, "what is this?", image_path=str(image))
+
+    assert "USE_HERMES" in result["text"]
+    assert "image_path" not in result
+
+
+def test_run_agent_reports_an_unreadable_image_file(session_factory, monkeypatch, tmp_path):
+    monkeypatch.setattr(chat_mod, "HERMES_AI_AVAILABLE", True)
+    monkeypatch.setattr(
+        chat_mod, "HermesAgentClient",
+        lambda *a, **k: StubHermes({"action": "reply", "text": "seen"}),
+    )
+    StubHermes.last = None       # class-level recorder: clear the previous test's
+    result = run_agent(session_factory, _hermes_settings(), "x",
+                       image_path=str(tmp_path / "gone.png"))
+
+    assert "again" in result["text"]
+    assert StubHermes.last is None, "an unreadable image must not reach the provider"
+
+
+# --- truncated answers -------------------------------------------------------
+# The provider occasionally cuts a long answer mid-string. A partial reply is
+# still worth showing; a partial tool call is not (guessing arguments is worse
+# than failing), so only "reply" fragments are salvaged.
+
+def test_truncated_reply_is_salvaged():
+    cut = '{"action": "reply", "text": "Parts 1-3 describe one strategy: entry on EMA(9) cro'
+    assert salvage_partial_reply(cut) == {
+        "action": "reply",
+        "text": "Parts 1-3 describe one strategy: entry on EMA(9) cro […]",
+    }
+
+
+def test_truncated_tool_call_is_not_salvaged():
+    cut = '{"action": "tool", "name": "backtest", "args": {"strategy_name": "ema_crosso'
+    assert salvage_partial_reply(cut) is None
+    assert salvage_partial_reply("not json at all") is None
+    assert salvage_partial_reply('{"action": "reply"}') is None
+
+
+def test_complete_json_uses_the_salvaged_partial_reply(cli_ok, monkeypatch):
+    cut = '{"action": "reply", "text": "the image shows an EMA crossover with an RSI fil'
+    monkeypatch.setattr("subprocess.run", cli_ok(_result_event(cut)))
+    out = HermesAgentClient().complete_json([{"role": "user", "content": "hi"}])
+    assert out["action"] == "reply"
+    assert "EMA crossover with an RSI fil" in out["text"]
+
+
+def test_complete_text_returns_the_answer_verbatim(cli_ok, monkeypatch):
+    partial = '{"description": "a chart with two EMAs and no close brace'
+    monkeypatch.setattr("subprocess.run", cli_ok(_result_event(partial)))
+    text = HermesAgentClient().complete_text(
+        [{"role": "user", "content": "transcribe"}], image=None
+    )
+    assert text == partial      # no JSON requirement, nothing thrown away
+
+
+def test_describe_pass_keeps_a_truncated_transcription(session_factory, tmp_path):
+    """A cut-off transcription must not become "(unreadable)"."""
+    images = [str(tmp_path / "a.png"), str(tmp_path / "b.png")]
+    for path in images:
+        (tmp_path / "a.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 16)
+    (tmp_path / "b.png").write_bytes((tmp_path / "a.png").read_bytes())
+    partial = '{"description": "ENTRY: EMA(9) crosses above EMA(21) on the 1h chart. FILTER: RSI'
+    seen = {}
+
+    class CutOff:
+        """complete_text hands back a JSON object the model never closed."""
+
+        enabled = True
+
+        def complete_text(self, messages, temperature=None, image=None):
+            return partial
+
+        def complete_json(self, messages, temperature=None, **kwargs):
+            seen["user_turn"] = messages[1]["content"]
+            return {"action": "reply", "text": "merged"}
+
+    result = run_agent(session_factory, _hermes_settings(), "read these",
+                       client=CutOff(), image_paths=images)
+
+    assert result["text"] == "merged"
+    assert "unreadable" not in seen["user_turn"]
+    assert "ENTRY: EMA(9) crosses above EMA(21)" in seen["user_turn"]
