@@ -4,6 +4,22 @@ Shared by the interactive setup wizard (scripts/setup.py) and the `algobot`
 command. All logic lives here so there is a single source of truth for how
 secrets are read from / written to .env, and for how the bot is started /
 stopped / inspected on the terminal.
+
+Commands (all argparse-free, in the plain terminal style the rest of this file
+uses):
+
+    algobot                    interactive menu
+    algobot start [args]       start the bot in the background
+    algobot stop               stop the bot
+    algobot status             show current state
+    algobot logs [N]           show the last N log lines
+    algobot setup              first-time configuration
+    algobot download [...]     fetch history into the DB (resumable, capped)
+    algobot export [...]       write trades / equity / summary files from the DB
+
+`download` and `export` are thin wrappers over
+``algotrading.market.download`` and ``algotrading.store.export`` so the CLI and
+the API/scripts cannot drift apart.
 """
 from __future__ import annotations
 
@@ -22,6 +38,49 @@ PID_PATH = PROJECT_ROOT / "data" / "algobot.pid"
 LOG_PATH = PROJECT_ROOT / "logs" / "algotrading.log"
 # How long `algobot stop` waits for a clean shutdown before SIGKILLing the group.
 STOP_GRACE_SECONDS = 20
+
+# How many stored candles one `algobot download --export` writes per pair.
+# Sized so an export of "everything I just downloaded" fits in one pass without
+# a phone-sized memory spike.
+EXPORT_LIMIT = 100_000
+
+DOWNLOAD_HELP = """\
+algobot download — fetch candles into the local database.
+
+Usage:
+  algobot download [--symbols A,B] [--intervals 1h,4h] [--days N]
+                   [--max-rows N] [--export PATH] [--db PATH]
+
+Options:
+  --symbols    comma-separated pairs       (default: market.symbols)
+  --intervals  comma-separated intervals   (default: market.intervals)
+  --days       history window in days      (default: market.backfill_days)
+  --max-rows   total rows this run may store (default: 200000)
+  --export     also write the stored candles to a .csv or .jsonl file
+  --db         database file to write into (default: the configured one)
+
+Re-running is cheap and safe: only the candles that are missing are fetched,
+and an interrupted run resumes where it stopped.
+"""
+
+EXPORT_HELP = """\
+algobot export — write the bot's trades, equity curve and summary to files.
+
+Usage:
+  algobot export [--dir DIR]
+                 [--trades-csv PATH] [--trades-json PATH]
+                 [--equity-csv PATH] [--summary-json PATH]
+
+Options:
+  --dir            write all four files into this directory
+  --trades-csv     trades as CSV
+  --trades-json    trades as a JSON array
+  --equity-csv     equity curve (closed trades, in time order)
+  --summary-json   counts, totals, latest analytics, mode/strategy metadata
+  --db             database file to read (default: the configured one)
+
+Read-only: exports never change bot state.
+"""
 
 # Field order shown to the user during setup.
 ENV_FIELDS: list[dict] = [
@@ -331,6 +390,218 @@ def show_logs(tail: int = 40) -> None:
         print(line)
 
 
+# ---------------------------------------------------------------------------
+# `algobot download` / `algobot export`
+# ---------------------------------------------------------------------------
+
+def _parse_flags(args: list[str]) -> dict[str, str]:
+    """Parse ``--flag value`` / ``--flag=value`` into a dict.
+
+    Argparse-free on purpose: this file's whole point is being runnable as a
+    plain script with no surprises on Termux, and these two commands take a
+    handful of optional flags. An unknown flag is reported by the caller, not
+    silently ignored.
+    """
+    opts: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if not token.startswith("--"):
+            i += 1
+            continue
+        if "=" in token:
+            key, _, value = token.partition("=")
+            opts[key] = value
+            i += 1
+            continue
+        following = args[i + 1] if i + 1 < len(args) else ""
+        if following and not following.startswith("--"):
+            opts[token] = following
+            i += 2
+        else:
+            opts[token] = ""
+            i += 1
+    return opts
+
+
+def _csv_list(value: str | None) -> list[str]:
+    """Split a comma-separated flag value, dropping blanks."""
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _int_flag(opts: dict[str, str], name: str, default: int) -> int:
+    raw = opts.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"  {name} expects a whole number, got {raw!r} — using {default}.")
+        return default
+
+
+def download(args: list[str]) -> None:
+    """`algobot download` — page history into the DB, optionally export it.
+
+    The work happens in ``algotrading.market.download.download_history`` (the
+    same ``backfill``/``upsert`` path the live tick uses), so this function only
+    parses flags, prints progress and reports the result. The bot does not need
+    to be running — but stop it first if it is, so the two are not writing to
+    the same SQLite file at once.
+    """
+    if "-h" in args or "--help" in args:
+        print(DOWNLOAD_HELP)
+        return
+
+    from algotrading.config import load_settings
+    from algotrading.db import get_session, init_db
+    from algotrading.market.binance_provider import BinanceMarketProvider
+    from algotrading.market.candles import CandleStore
+    from algotrading.market.download import (
+        DEFAULT_MAX_ROWS,
+        download_history,
+        export_candles,
+    )
+
+    opts = _parse_flags(args)
+    known = {"--symbols", "--intervals", "--days", "--max-rows", "--export", "--db"}
+    unknown = sorted(set(opts) - known)
+    if unknown:
+        print(f"Unknown option(s): {', '.join(unknown)}")
+        print(DOWNLOAD_HELP)
+        return
+
+    settings = load_settings()
+    symbols = _csv_list(opts.get("--symbols")) or list(settings.market.symbols)
+    intervals = _csv_list(opts.get("--intervals")) or list(settings.market.intervals)
+    days = _int_flag(opts, "--days", int(settings.market.backfill_days))
+    max_rows = _int_flag(opts, "--max-rows", DEFAULT_MAX_ROWS)
+    export_path = opts.get("--export") or ""
+    db_path = opts.get("--db") or settings.db_path
+
+    print(
+        f"Downloading {days} days of history for {', '.join(symbols)} "
+        f"at {', '.join(intervals)} (row cap {max_rows})."
+    )
+    init_db(db_path)
+
+    def _progress(symbol: str, interval: str, rows: int) -> None:
+        print(f"  {symbol} {interval}: {rows} candles stored")
+
+    with get_session(db_path) as session:
+        store = CandleStore(session)
+        report = download_history(
+            BinanceMarketProvider(),
+            store,
+            symbols,
+            intervals,
+            days,
+            max_rows=max_rows,
+            progress=_progress,
+        )
+
+        if export_path:
+            rows = []
+            for entry in report["results"]:
+                rows.extend(
+                    store.get(entry["symbol"], entry["interval"], limit=EXPORT_LIMIT)
+                )
+            written = export_candles(rows, export_path)
+            print(f"Exported {written} candles to {export_path}")
+
+    resumed = sum(1 for r in report["results"] if r["resumed"])
+    print(
+        f"Done: {report['total_rows']} rows stored "
+        f"across {len(report['results'])} symbol/interval pair(s) "
+        f"({resumed} resumed)."
+    )
+    for entry in report["results"]:
+        if entry["error"]:
+            print(f"  !! {entry['symbol']} {entry['interval']}: {entry['error']}")
+        elif entry["capped"]:
+            print(
+                f"  .. {entry['symbol']} {entry['interval']}: row cap reached — "
+                "re-run to continue where this stopped"
+            )
+    if report["errors"]:
+        print("Some pairs failed (see above); re-running resumes them.")
+
+
+def export(args: list[str]) -> None:
+    """`algobot export` — write trades/equity/summary files from the database.
+
+    Read-only: every exporter reads the DB and writes one file. With no flags
+    the help text is printed rather than an error, because that is what a
+    non-technical user gets after trying the command bare.
+    """
+    if "-h" in args or "--help" in args:
+        print(EXPORT_HELP)
+        return
+
+    from algotrading.config import load_settings
+    from algotrading.db import get_session
+    from algotrading.store.export import (
+        export_equity_csv,
+        export_summary_json,
+        export_trades_csv,
+        export_trades_json,
+    )
+
+    opts = _parse_flags(args)
+    known = {
+        "--dir", "--db", "--trades-csv", "--trades-json",
+        "--equity-csv", "--summary-json",
+    }
+    unknown = sorted(set(opts) - known)
+    if unknown:
+        print(f"Unknown option(s): {', '.join(unknown)}")
+        print(EXPORT_HELP)
+        return
+
+    settings = load_settings()
+    db_path = opts.get("--db") or settings.db_path
+
+    out_dir = opts.get("--dir") or ""
+    targets = {
+        "trades_csv": opts.get("--trades-csv") or (f"{out_dir}/trades.csv" if out_dir else ""),
+        "trades_json": opts.get("--trades-json") or (f"{out_dir}/trades.json" if out_dir else ""),
+        "equity_csv": opts.get("--equity-csv") or (f"{out_dir}/equity.csv" if out_dir else ""),
+        "summary_json": opts.get("--summary-json") or (f"{out_dir}/summary.json" if out_dir else ""),
+    }
+    if not any(targets.values()):
+        print(EXPORT_HELP)
+        return
+
+    with get_session(db_path) as session:
+        if targets["trades_csv"]:
+            n = export_trades_csv(session, targets["trades_csv"])
+            print(f"trades      -> {targets['trades_csv']} ({n} rows)")
+        if targets["trades_json"]:
+            n = export_trades_json(session, targets["trades_json"])
+            print(f"trades JSON -> {targets['trades_json']} ({n} rows)")
+        if targets["equity_csv"]:
+            n = export_equity_csv(
+                session,
+                targets["equity_csv"],
+                initial_balance=float(settings.risk.paper_initial_balance),
+            )
+            print(f"equity      -> {targets['equity_csv']} ({n} points)")
+        if targets["summary_json"]:
+            summary = export_summary_json(
+                session,
+                targets["summary_json"],
+                mode=settings.mode,
+                initial_balance=float(settings.risk.paper_initial_balance),
+            )
+            counts = summary["counts"]
+            print(
+                f"summary     -> {targets['summary_json']} "
+                f"({counts['trades']} trades, {counts['open_positions']} open)"
+            )
+
+
 def menu() -> None:
     while True:
         print()
@@ -340,6 +611,8 @@ def menu() -> None:
         print("  3) Status")
         print("  4) Show recent logs")
         print("  5) Run configuration setup")
+        print("  6) Download market history")
+        print("  7) Export trades / equity / summary")
         print("  0) Exit")
         choice = _input("  > ")
         if choice == "1":
@@ -352,6 +625,10 @@ def menu() -> None:
             show_logs()
         elif choice == "5":
             run_setup()
+        elif choice == "6":
+            download([])
+        elif choice == "7":
+            export([])
         elif choice == "0":
             break
         else:
@@ -392,6 +669,10 @@ def main() -> None:
             show_logs(tail)
         elif cmd == "setup":
             run_setup()
+        elif cmd == "download":
+            download(sys.argv[2:])
+        elif cmd == "export":
+            export(sys.argv[2:])
         else:
             menu()
     else:

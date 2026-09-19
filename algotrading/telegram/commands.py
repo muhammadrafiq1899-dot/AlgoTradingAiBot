@@ -27,12 +27,17 @@ from telegram.ext import (
     filters,
 )
 
+from algotrading.ai.news import fetch_headlines
+from algotrading.analytics.portfolio import portfolio_snapshot
 from algotrading.db.models import Position, Signal, Strategy, Trade, TradeIntent
+from algotrading.store.export import export_summary_json, export_trades_csv
 from algotrading.strategy.catalog import catalog_entries
 from algotrading.telegram.ui import (
     IMAGE_FLOW_MODES,
     approval_keyboard,
     backtest_keyboard,
+    format_news,
+    format_portfolio,
     format_risk,
     format_status,
     format_strategy_catalog,
@@ -158,6 +163,13 @@ IMAGE_FLOW_SEPARATE_FOLLOWUP = (
 
 IMAGE_FLOW_EXPIRED = (
     "⌛ That image set expired — send the pictures again and I'll re-read them."
+)
+
+# Shown by /news when the feed module is switched off. Public RSS is opt-in
+# because it is the only place the bot talks to a third-party website.
+NEWS_DISABLED_TEXT = (
+    "📰 News headlines are off. Set ai.news_enabled: true in "
+    "config/settings.yaml (and pick news_feed_urls) and restart the bot."
 )
 
 # Buffered uploads, keyed by chat: [(path, caption), ...] awaiting a flush.
@@ -363,6 +375,9 @@ def build_handlers(
             "/strategies — available strategies (tap one to backtest)\n"
             "/risk — current risk limits\n"
             "/summary — analytics summary (M5)\n"
+            "/portfolio — exposure + correlation view (risk context, not a signal)\n"
+            "/news — recent headlines (needs ai.news_enabled)\n"
+            "/export — write trades (CSV) + summary (JSON) under data/exports/\n"
             "/paper — switch to paper mode\n"
             "/live — switch to live mode (guarded)\n"
             "…or just chat: ask about the bot, or send a photo/screenshot and "
@@ -471,6 +486,78 @@ def build_handlers(
             )
         finally:
             sess.close()
+
+    # --- /portfolio (exposure + descriptive correlation; read-only) ---
+    @auth
+    @_rate_limited
+    async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Exposure per symbol + a correlation matrix over stored closes.
+
+        Read-only and advisory: nothing here feeds sizing or signals.
+        """
+        sess = session_for(update)
+        try:
+            text = format_portfolio(portfolio_snapshot(sess, settings))
+        except Exception:  # noqa: BLE001 - a view must never break the bot
+            log.exception("/portfolio failed")
+            text = "📊 Could not build the portfolio view — see logs/algotrading.log."
+        finally:
+            sess.close()
+        await update.effective_message.reply_text(text, parse_mode=TEXT_MARKDOWN)
+
+    # --- /news (public RSS headlines; untrusted third-party data) ---
+    @auth
+    @_rate_limited
+    async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the configured feed headlines, or say the feature is off.
+
+        Fetched in a worker thread (network) with a TTL cache in ``ai/news.py``,
+        so a repeated /news costs nothing. Headline text is shown as data only.
+        """
+        ai = getattr(settings, "ai", None)
+        if ai is None or not getattr(ai, "news_enabled", False):
+            await update.effective_message.reply_text(NEWS_DISABLED_TEXT)
+            return
+        try:
+            headlines = await asyncio.to_thread(fetch_headlines, ai)
+        except Exception:  # noqa: BLE001 - offline phone is normal, not an error
+            log.warning("/news fetch failed", exc_info=True)
+            headlines = []
+        await update.effective_message.reply_text(
+            format_news(headlines), parse_mode=TEXT_MARKDOWN
+        )
+
+    # --- /export (write the trade history to files on the device) ---
+    @auth
+    @_rate_limited
+    async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Dump trades + a summary to files under ``data/exports/``.
+
+        Read-only with respect to trading state: it reads the DB and writes
+        files, nothing else. Useful on the phone, where the practical way to get
+        the history off the device is a path you can scp/cat — Telegram is just
+        where that path is announced.
+        """
+        sess = session_for(update)
+        try:
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            out_dir = Path(settings.data_dir) / "exports"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            trades_path = out_dir / f"trades-{stamp}.csv"
+            summary_path = out_dir / f"summary-{stamp}.json"
+            n_trades = export_trades_csv(sess, trades_path)
+            export_summary_json(sess, summary_path)
+            text = (
+                f"📤 <b>Exported</b> {n_trades} trade(s)\n"
+                f"<code>{html.escape(str(trades_path))}</code>\n"
+                f"<code>{html.escape(str(summary_path))}</code>"
+            )
+        except Exception:  # noqa: BLE001 - an export must never break the bot
+            log.exception("/export failed")
+            text = "📤 Export failed — see logs/algotrading.log."
+        finally:
+            sess.close()
+        await update.effective_message.reply_text(text, parse_mode=TEXT_MARKDOWN)
 
     # --- natural-language chat (LLM orchestrator) ---
     @auth
@@ -675,6 +762,9 @@ def build_handlers(
         CommandHandler("strategies", strategies_cmd),
         CommandHandler("risk", risk_cmd),
         CommandHandler("summary", summary_cmd),
+        CommandHandler("portfolio", portfolio_cmd),
+        CommandHandler("news", news_cmd),
+        CommandHandler("export", export_cmd),
         CallbackQueryHandler(on_callback, pattern=r"^(approve|reject|bt|imgflow):"),
     ]
     if session_factory is not None:

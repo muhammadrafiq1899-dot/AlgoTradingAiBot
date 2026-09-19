@@ -9,6 +9,15 @@ Public endpoints (klines, ticker, time) require no API keys and work in both
 paper and live modes. Signed endpoints (orders) require keys and are only used
 by the execution gateway in live mode.
 
+Venues (see `resolve_venue` / `from_settings`): the client talks to exactly one
+venue, chosen once at construction. ``testnet=True`` or an explicit
+``base_url`` select Binance's spot testnet (https://testnet.binance.vision).
+There is deliberately **no** fallback from testnet to mainnet: a missing
+testnet key fails loudly instead of quietly sending real orders to the live
+market. Market **data** must come from the same venue as the orders — testnet
+klines exist but have thinner liquidity and a much shorter history than
+mainnet, so a testnet run produces testnet-looking prices.
+
 Docs: https://developers.binance.com/docs/binance-spot-api-docs
 """
 from __future__ import annotations
@@ -28,6 +37,11 @@ log = logging.getLogger(__name__)
 SPOT_BASE = "https://api.binance.com"
 TESTNET_BASE = "https://testnet.binance.vision"
 DEFAULT_TIMEOUT = 15
+
+# Binance rejects a clientOrderId longer than this (chars: A-Z a-z 0-9 _ - .).
+MAX_CLIENT_ORDER_ID_LEN = 36
+ORDER_PATH = "/api/v3/order"
+OPEN_ORDERS_PATH = "/api/v3/openOrders"
 
 # Retry configuration
 RETRY_MAX_ATTEMPTS = 3
@@ -93,20 +107,84 @@ def with_retry(func: Callable[..., T]) -> Callable[..., T]:
     return wrapper
 
 
+def resolve_venue(market: Any) -> tuple[str, bool]:
+    """Resolve ``(base_url, testnet)`` from a ``MarketConfig`` or ``Settings``.
+
+    An explicit ``market.base_url`` wins over everything (self-hosted mirrors,
+    a local proxy); otherwise ``market.use_testnet`` selects the spot testnet.
+    Both values are returned — not just the URL — because the API *keys* differ
+    per venue, and the caller must not guess which one it is holding.
+    """
+    cfg = getattr(market, "market", market)
+    use_testnet = bool(getattr(cfg, "use_testnet", False))
+    explicit = str(getattr(cfg, "base_url", "") or "").strip()
+    if explicit:
+        return explicit.rstrip("/"), use_testnet
+    return (TESTNET_BASE if use_testnet else SPOT_BASE), use_testnet
+
+
 class BinanceRestClient:
     def __init__(
         self,
         api_key: str = "",
         api_secret: str = "",
-        base_url: str = SPOT_BASE,
+        base_url: str = "",
         testnet: bool = False,
         timeout: int = DEFAULT_TIMEOUT,
     ) -> None:
         self._key = api_key
         self._secret = api_secret
-        self._base = TESTNET_BASE if testnet else base_url
+        # Explicit URL > testnet > mainnet. `base_url=""` is the "not set" value
+        # the config uses, so an empty string must never become the URL.
+        explicit = (base_url or "").strip()
+        if explicit:
+            self._base = explicit.rstrip("/")
+        else:
+            self._base = TESTNET_BASE if testnet else SPOT_BASE
+        self._testnet = testnet
         self._timeout = timeout
         self._session = requests.Session()
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: Any,
+        *,
+        api_key: str = "",
+        api_secret: str = "",
+        require_keys: bool = False,
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> BinanceRestClient:
+        """Build a client for the venue the settings select.
+
+        ``require_keys=True`` (the live order path) raises instead of returning
+        a keyless client: an unauthenticated client on the testnet base would
+        fail later, and there is no mainnet fallback by design — silently
+        trading the real market because a testnet key was missing is the exact
+        failure this guards against.
+        """
+        base, testnet = resolve_venue(settings)
+        if require_keys and (not api_key or not api_secret):
+            venue = "testnet (BINANCE_TESTNET_API_KEY/SECRET)" if testnet else "mainnet (BINANCE_API_KEY/SECRET)"
+            raise BinanceError(
+                f"missing Binance API credentials for {venue}; refusing to start "
+                "authenticated trading without keys (no mainnet fallback)"
+            )
+        return cls(
+            api_key=api_key,
+            api_secret=api_secret,
+            base_url=base,
+            testnet=testnet,
+            timeout=timeout,
+        )
+
+    @property
+    def base_url(self) -> str:
+        return self._base
+
+    @property
+    def testnet(self) -> bool:
+        return self._testnet
 
     # ---------- auth/signing helpers ----------
 
@@ -222,6 +300,20 @@ class BinanceRestClient:
                 out[bal["asset"]] = free + locked
         return out
 
+    def get_balance(self, asset: str = "USDT") -> float:
+        """Free + locked balance of one asset (0.0 when the account holds none).
+
+        Deliberately reuses `account_balances()` rather than adding a per-asset
+        endpoint: sizing needs the quote balance on every entry, and a second
+        signed call per tick would only add request weight (weight limit 6000/min
+        on spot; `/api/v3/account` costs 20).
+        """
+        return float(self.account_balances().get(asset.upper(), 0.0))
+
+    @staticmethod
+    def _client_id_param(client_order_id: str | None) -> dict[str, Any]:
+        return {"newClientOrderId": client_order_id} if client_order_id else {}
+
     def create_order(
         self,
         symbol: str,
@@ -238,7 +330,73 @@ class BinanceRestClient:
         }
         if client_order_id:
             params["newClientOrderId"] = client_order_id
-        return self._post("/api/v3/order", params=params, signed=True)
+        return self._post(ORDER_PATH, params=params, signed=True)
+
+    def place_limit_order(
+        self,
+        symbol: str,
+        side: str,  # buy | sell
+        quantity: float,
+        price: float,
+        client_order_id: str | None = None,
+        time_in_force: str = "GTC",
+    ) -> dict[str, Any]:
+        """POST a resting LIMIT order.
+
+        A limit order is *not* synchronously filled: Binance returns
+        ``status=NEW`` (or ``FILLED`` when it crossed on arrival) and the fill
+        arrives later, so the caller must treat anything but ``FILLED`` as
+        `sent` and let the reconcile path confirm it.
+        """
+        params: dict[str, Any] = {
+            "symbol": self._sym(symbol),
+            "side": side.upper(),
+            "type": "LIMIT",
+            "timeInForce": time_in_force,
+            "quantity": quantity,
+            "price": price,
+        }
+        params.update(self._client_id_param(client_order_id))
+        return self._post(ORDER_PATH, params=params, signed=True)
+
+    def place_stop_order(
+        self,
+        symbol: str,
+        side: str,  # buy | sell
+        quantity: float,
+        stop_price: float,
+        limit_price: float | None = None,
+        client_order_id: str | None = None,
+        time_in_force: str = "GTC",
+    ) -> dict[str, Any]:
+        """POST a resting protective STOP order (STOP_LOSS or STOP_LOSS_LIMIT).
+
+        Binance requires ``stopPrice`` on both types and, for
+        ``STOP_LOSS_LIMIT``, a ``price`` as well — ``timeInForce`` is only
+        meaningful on the limit variant. The exchange's *response* carries
+        ``orderId`` plus ``clientOrderId`` (our idempotency key) and
+        ``origQuoteOrderId``; the quote id is a response field, never a request
+        parameter, so it cannot be used to place or find an order — we key on
+        ``newClientOrderId``.
+
+        With no ``limit_price`` this sends a market ``STOP_LOSS``, which is the
+        safest default for protection: once triggered it always fills, whereas
+        a ``STOP_LOSS_LIMIT`` can be left unfilled through a gap and leave the
+        position unprotected. A limit variant is only worth it when the caller
+        is explicitly willing to trade certainty for a price floor/ceiling.
+        """
+        params: dict[str, Any] = {
+            "symbol": self._sym(symbol),
+            "side": side.upper(),
+            "type": "STOP_LOSS_LIMIT" if limit_price is not None else "STOP_LOSS",
+            "quantity": quantity,
+            "stopPrice": stop_price,
+        }
+        if limit_price is not None:
+            params["price"] = limit_price
+            params["timeInForce"] = time_in_force
+        params.update(self._client_id_param(client_order_id))
+        return self._post(ORDER_PATH, params=params, signed=True)
 
     def get_order(self, symbol: str, client_order_id: str | None = None, order_id: int | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"symbol": self._sym(symbol)}
@@ -246,7 +404,7 @@ class BinanceRestClient:
             params["origClientOrderId"] = client_order_id
         if order_id is not None:
             params["orderId"] = order_id
-        return self._get("/api/v3/order", params=params, signed=True)
+        return self._get(ORDER_PATH, params=params, signed=True)
 
     def cancel_order(self, symbol: str, client_order_id: str | None = None, order_id: int | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"symbol": self._sym(symbol)}
@@ -254,10 +412,14 @@ class BinanceRestClient:
             params["origClientOrderId"] = client_order_id
         if order_id is not None:
             params["orderId"] = order_id
-        return self._delete("/api/v3/order", params=params, signed=True)
+        return self._delete(ORDER_PATH, params=params, signed=True)
 
     def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}
         if symbol:
             params["symbol"] = self._sym(symbol)
-        return self._get("/api/v3/openOrders", params=params, signed=True)
+        return self._get(OPEN_ORDERS_PATH, params=params, signed=True)
+
+    def list_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """Alias of `open_orders` matching the gateway's optional-capability name."""
+        return self.open_orders(symbol)

@@ -10,12 +10,57 @@ you tap **Approve** or it doesn't happen.
 > paper (or real) trades on Binance. You talk to it in Telegram. You can ask the
 > AI for a new strategy in plain English and it drafts one for your approval.
 
-**Status:** all milestones complete · **230 tests pass** (`pytest tests/`).
+**Status:** all milestones complete · **547 tests pass** (`pytest tests/`).
 Version `0.1.0`.
 
 ---
 
 ## Changelog
+
+### 2026-09-19 — the safety limits now actually apply, and the research got honest
+
+- **The limits you set are the limits that run.** Max position size and the daily
+  loss limit used to be *checked at startup only* — the bot sized every order from
+  a hardcoded 100,000 balance. Now a strategy asking for 50% of your balance gets
+  capped to your `max_position_pct` (20% by default), a day that loses
+  `max_daily_loss_pct` stops **new** entries until midnight UTC while protective
+  exits keep working, and sizing uses your configured balance (or the exchange's,
+  when it can report one).
+- **You can trade the timeframe you meant.** Set `market.eval_interval` (say `5m`)
+  and the engine evaluates *that* interval. Before, it always looked at 1h no
+  matter which intervals you were collecting.
+- **Backtests now include the costs you actually pay.** Slippage and fees come
+  from your settings, optional `backtest.apply_risk_checks` reproduces your
+  cooldown/exposure caps so a backtest stops promising trades the live bot would
+  have skipped, and each run states its assumptions. On a 2,000-bar replay the
+  costs alone moved a −0.26% result to −7.3% — that is the difference between a
+  believable number and a flattering one.
+- **Reports you can judge a strategy by**: Sharpe, Sortino, expectancy, profit
+  factor, exposure, per-day/week/month/year breakdown, **walk-forward folds**
+  (does it hold up across the whole history, not just one lucky stretch) and
+  **Monte Carlo ranges** instead of a single number.
+- **Parameter search that cannot change anything by itself.** Run it from the
+  terminal; the best candidate comes back to Telegram as an Approve/Reject card
+  like any other proposal. It runs as a separate low-priority process so it never
+  steals CPU from the trading cycle.
+- **Protection that survives Android killing the app.** Optional
+  `risk.exchange_stop_enabled: true` leaves a stop order resting **on Binance**
+  after a fill — the only kind of protection that keeps working when the phone
+  kills Termux (see §12). The bot's own trailing stop still runs every cycle.
+- **Practice with real order code, no real money:** `market.use_testnet: true`
+  plus testnet keys sends live-mode orders to Binance's testnet.
+- **A read-only dashboard** at `http://127.0.0.1:8000/dashboard` — positions,
+  today's P&L, the daily-loss state, data freshness, heartbeat and trades
+  (needs `api.enabled: true` and your `API_TOKEN`). Plus **exports**: `/export/trades.csv`,
+  `/export/summary.json`, Telegram `/export`, and `algobot export`.
+- **Get told what happened:** an optional webhook alert channel
+  (`ALERT_WEBHOOK_URL` in `.env`) for fills, risk skips and errors.
+- **Deeper, portable data:** `algobot download --days 365`, weekly/monthly
+  intervals, and candle files (CSV/JSONL) you can backtest offline with no network.
+- **The assistant gets context, never control:** optional news headlines, a log of
+  what it proposed and how each change actually performed (fed back as lessons),
+  and a `/portfolio` exposure + correlation view. It still cannot place an order
+  or change a setting — every proposal waits for your ✅.
 
 ### 2026-09-19 — keeps running with the screen off, and stops eating your battery
 
@@ -290,8 +335,11 @@ that would change how the bot trades.
 | `/status` | The essentials: mode (paper/live), the active strategy and its settings, open positions, and recent orders. Start here. |
 | `/strategies` | **Every strategy the bot can run**, ranked best-first by a risk-adjusted score, with its full parameter list and allowed ranges. Buttons underneath let you backtest any one of them. |
 | `/strategy` | Your *saved versions* — which release is active and which are waiting, with their parameters. |
-| `/risk` | Your safety limits: risk per trade, max position size, max number of positions, cooldown between entries, slippage, and whether the trailing stop is on. |
+| `/risk` | Your safety limits: risk per trade, max position size, max number of positions, cooldown between entries, slippage, the daily loss limit, and whether the trailing stop is on. These are enforced while trading, not just validated at startup. |
 | `/summary` | Recent performance summaries (win rate, expectancy) from closed trades. |
+| `/portfolio` | Your open exposure per coin, and how closely they move together. Context for reading your risk — it is not a trading signal. |
+| `/news` | Recent headlines for the markets you trade (only if you enabled `ai.news_enabled`). Headlines are treated as untrusted data, never as instructions. |
+| `/export` | Writes your trades to a CSV and a summary to JSON under `data/exports/` and replies with the file paths, so you can pull them off the phone. |
 | `/start_bot` | Pauses/restarts the scheduler so the bot stops opening new trades. |
 | `/stop_bot` | Resumes it. |
 
@@ -843,7 +891,7 @@ chmod +x ~/.termux/services/algotrading/run
 ## 24. Testing
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 256 tests
+.venv/bin/python -m pytest tests/ -q          # 547 tests
 bash scripts/check_project_map.sh             # map freshness
 .venv/bin/python -m compileall -q algotrading # byte-compile check
 ```

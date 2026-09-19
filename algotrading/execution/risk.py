@@ -29,6 +29,46 @@ class RiskManager:
 
     # --- sizing ---
 
+    def clamp_position_pct(self, position_pct: float) -> float:
+        """Clamp a requested fraction-of-balance to the configured ceiling.
+
+        `max_position_pct` is the hard cap the order path must honour. Sizing
+        requests arrive inside `Signal.risk` (strategy params, AI-authored
+        params, or a future model), so the cap belongs here, not in the schema.
+        """
+        try:
+            pct = float(position_pct)
+        except (TypeError, ValueError):
+            return 0.0
+        if pct <= 0:
+            return 0.0
+        return min(pct, self._cfg.max_position_pct / 100.0)
+
+    def size_by_pct(self, balance: float, price: float, position_pct: float) -> float:
+        """Quantity for a buy sized as `position_pct` of balance, capped.
+
+        Returns 0.0 when the inputs cannot produce a sane order (the caller
+        records a `risk_skipped` event for `qty <= 0`).
+        """
+        if balance <= 0 or price <= 0:
+            return 0.0
+        return balance * self.clamp_position_pct(position_pct) / price
+
+    def daily_loss_breached(self, daily_pnl: float, balance: float) -> tuple[bool, float]:
+        """Is today's realized loss at/over `max_daily_loss_pct`?
+
+        Returns `(breached, loss_pct)`. A disabled guard (pct 0, or
+        `enforce_daily_loss: false`) never breaches, so the fail-open path is
+        explicit and reviewable rather than accidental.
+        """
+        if not self._cfg.enforce_daily_loss:
+            return False, 0.0
+        limit = self._cfg.max_daily_loss_pct
+        if limit <= 0 or balance <= 0 or daily_pnl >= 0:
+            return False, 0.0
+        loss_pct = (-daily_pnl / balance) * 100.0
+        return loss_pct >= limit, loss_pct
+
     def size_position(self, balance: float, price: float, atr_value: float | None = None) -> float:
         """Size a spot buy so that a stop-loss distance risks `risk_per_trade_pct`.
 
@@ -97,8 +137,21 @@ class RiskManager:
     # --- guards ---
 
     def check_buy(self, *, symbol: str, balance: float, open_positions: int,
-                  last_entry_ts: float | None) -> RiskDecision:
-        """Guards for opening a new long position on `symbol`."""
+                  last_entry_ts: float | None, daily_pnl: float = 0.0) -> RiskDecision:
+        """Guards for opening a new long position on `symbol`.
+
+        `daily_pnl` is today's realized PnL (UTC). A breach only blocks *new
+        entries* — protective exits must always be able to run.
+        """
+        breached, loss_pct = self.daily_loss_breached(daily_pnl, balance)
+        if breached:
+            return RiskDecision(
+                False,
+                reason=(
+                    f"daily loss limit reached ({loss_pct:.2f}% >= "
+                    f"{self._cfg.max_daily_loss_pct:.2f}%)"
+                ),
+            )
         if open_positions >= self._cfg.max_open_positions:
             return RiskDecision(False, reason="max_open_positions reached")
         if last_entry_ts is not None:

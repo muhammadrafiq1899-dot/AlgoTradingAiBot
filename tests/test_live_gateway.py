@@ -5,6 +5,9 @@ Covers:
   path (no executedQty), and the BinanceError -> "unknown" safety path.
 - LiveGateway.get_order: filled / open status mapping.
 - LiveGateway.get_open_orders: client_order_id extraction for reconcile.
+- LiveGateway's optional capabilities (P2-8): resting LIMIT / STOP_LOSS /
+  STOP_LOSS_LIMIT orders, cancel (including "already gone" as canceled), and
+  the venue balance.
 - supervisor.reconcile: drift detection when a pending intent has no matching
   exchange order; "OK: no drift" when everything reconciles.
 - supervisor.health: heartbeat file write/read, wake-lock availability.
@@ -35,6 +38,14 @@ class StubClient:
         self.get_order_payload = {}
         self.get_order_error = None
         self.open_orders_payload = []
+        self.limit_payload = {}
+        self.limit_error = None
+        self.stop_payload = {}
+        self.stop_error = None
+        self.cancel_payload = {}
+        self.cancel_error = None
+        self.balance = 0.0
+        self.balance_error = None
         self.calls = []
 
     def create_order(self, symbol, side, quantity, order_type="MARKET", client_order_id=None):
@@ -52,6 +63,32 @@ class StubClient:
     def open_orders(self, symbol=None):
         self.calls.append(("open_orders", symbol))
         return self.open_orders_payload
+
+    def place_limit_order(self, symbol, side, quantity, price, client_order_id=None, time_in_force="GTC"):
+        self.calls.append(("place_limit_order", symbol, side, quantity, price, client_order_id, time_in_force))
+        if self.limit_error:
+            raise self.limit_error
+        return self.limit_payload
+
+    def place_stop_order(self, symbol, side, quantity, stop_price, limit_price=None, client_order_id=None):
+        self.calls.append(
+            ("place_stop_order", symbol, side, quantity, stop_price, limit_price, client_order_id)
+        )
+        if self.stop_error:
+            raise self.stop_error
+        return self.stop_payload
+
+    def cancel_order(self, symbol, client_order_id=None, order_id=None):
+        self.calls.append(("cancel_order", symbol, client_order_id))
+        if self.cancel_error:
+            raise self.cancel_error
+        return self.cancel_payload
+
+    def get_balance(self, asset="USDT"):
+        self.calls.append(("get_balance", asset))
+        if self.balance_error:
+            raise self.balance_error
+        return self.balance
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +199,145 @@ def test_live_get_open_orders_extracts_client_order_id():
     ids = {o["client_order_id"] for o in open_orders}
     assert ids == {"idem-1", "idem-2"}
     assert client.calls[0] == ("open_orders", "BTCUSDT")
+
+
+# ---------------------------------------------------------------------------
+# LiveGateway: optional capabilities (limit / stop / cancel / balance)
+# ---------------------------------------------------------------------------
+
+def test_live_place_limit_order_rests_and_passes_time_in_force():
+    client = StubClient()
+    client.limit_payload = {"orderId": 555, "status": "NEW", "executedQty": "0"}
+    gw = LiveGateway(client)
+
+    result = gw.place_limit_order("BTCUSDT", "buy", 0.5, 61234.5, "idem-lim-1", time_in_force="GTC")
+
+    assert isinstance(result, OrderResult)
+    assert result.status == "open"          # a limit order is not a fill
+    assert result.order_id == "555"
+    assert result.filled_qty == 0.0
+    assert client.calls[0] == ("place_limit_order", "BTCUSDT", "buy", 0.5, 61234.5, "idem-lim-1", "GTC")
+
+
+def test_live_place_limit_order_filled_on_arrival_reports_the_fill():
+    client = StubClient()
+    client.limit_payload = {
+        "orderId": 556,
+        "status": "FILLED",
+        "executedQty": "0.5",
+        "fills": [{"price": "61000.0", "qty": "0.5", "commission": "0.03"}],
+    }
+    gw = LiveGateway(client)
+
+    result = gw.place_limit_order("BTCUSDT", "buy", 0.5, 61500.0, "idem-lim-2")
+
+    assert result.status == "filled"
+    assert result.filled_qty == 0.5
+    assert result.avg_fill_price == pytest.approx(61000.0)
+    assert result.fee == pytest.approx(0.03)
+
+
+def test_live_place_limit_order_error_is_rejected_not_unknown():
+    """A refused LIMIT left nothing resting, so a retry is safe."""
+    client = StubClient()
+    client.limit_error = BinanceError("insufficient balance")
+    gw = LiveGateway(client)
+
+    result = gw.place_limit_order("BTCUSDT", "buy", 0.5, 61000.0, "idem-lim-3")
+
+    assert result.status == "rejected"
+    assert "insufficient balance" in result.error
+
+
+def test_live_place_stop_order_rests_with_stop_and_limit_price():
+    client = StubClient()
+    client.stop_payload = {"orderId": 777, "status": "NEW", "executedQty": "0"}
+    gw = LiveGateway(client)
+
+    result = gw.place_stop_order(
+        "BTCUSDT", "sell", 0.5, 59_000.0, limit_price=58_950.0, client_order_id="stop-1-1"
+    )
+
+    assert result.status == "open"
+    assert result.order_id == "777"
+    assert client.calls[0] == (
+        "place_stop_order", "BTCUSDT", "sell", 0.5, 59_000.0, 58_950.0, "stop-1-1"
+    )
+
+
+def test_live_place_stop_order_market_variant_sends_no_limit_price():
+    client = StubClient()
+    client.stop_payload = {"orderId": 778, "status": "NEW"}
+    gw = LiveGateway(client)
+
+    gw.place_stop_order("BTCUSDT", "sell", 0.5, 59_000.0, client_order_id="stop-1-1")
+
+    assert client.calls[0][5] is None       # limit_price not given
+    assert client.calls[0][6] == "stop-1-1"
+
+
+def test_live_place_stop_order_rejected_is_not_ambiguous():
+    client = StubClient()
+    client.stop_error = BinanceError("stop price would trigger immediately")
+    gw = LiveGateway(client)
+
+    result = gw.place_stop_order("BTCUSDT", "sell", 0.5, 60_000.0, client_order_id="stop-x")
+
+    assert result.status == "rejected"
+    assert "trigger immediately" in result.error
+
+
+def test_live_cancel_order_reports_canceled():
+    client = StubClient()
+    client.cancel_payload = {"orderId": 777, "status": "CANCELED"}
+    gw = LiveGateway(client)
+
+    result = gw.cancel_order("BTCUSDT", "stop-1-1")
+
+    assert result.status == "canceled"
+    assert client.calls[0] == ("cancel_order", "BTCUSDT", "stop-1-1")
+
+
+def test_live_cancel_order_already_gone_counts_as_canceled():
+    """-2011 means nothing is resting: the desired end state, not a failure."""
+    client = StubClient()
+    client.cancel_error = BinanceError(
+        "Binance 400: {'code': -2011, 'msg': 'Unknown order sent.'}"
+    )
+    gw = LiveGateway(client)
+
+    assert gw.cancel_order("BTCUSDT", "stop-1-1").status == "canceled"
+
+
+def test_live_cancel_order_other_error_is_unknown_and_retryable():
+    client = StubClient()
+    client.cancel_error = BinanceError("network error on DELETE /api/v3/order", retryable=True)
+    gw = LiveGateway(client)
+
+    result = gw.cancel_order("BTCUSDT", "stop-1-1")
+
+    assert result.status == "unknown"
+    assert result.error
+
+
+def test_live_get_balance_reads_the_venue():
+    client = StubClient()
+    client.balance = 1_234.56
+    gw = LiveGateway(client)
+
+    assert gw.get_balance() == pytest.approx(1_234.56)
+    assert client.calls[0] == ("get_balance", "USDT")
+    assert gw.get_balance("BTC") == pytest.approx(1_234.56)
+    assert client.calls[1] == ("get_balance", "BTC")
+
+
+def test_live_get_balance_propagates_failure_instead_of_inventing_a_number():
+    client = StubClient()
+    client.balance_error = BinanceError("IP not whitelisted")
+    gw = LiveGateway(client)
+
+    with pytest.raises(BinanceError):
+        gw.get_balance()
 
 
 # ---------------------------------------------------------------------------

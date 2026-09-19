@@ -19,19 +19,70 @@ market:
     - 1h
     - 4h
     - 1d
+    - 1w
+    - 1M
+  # Interval the strategy engine evaluates. null = legacy rule ("1h" if present,
+  # else the first interval). Set it (e.g. 5m) to actually trade a faster
+  # timeframe — the stale-data allowance follows this interval's length.
+  eval_interval: null
   backfill_days: 30
   poll_seconds: 60
   max_staleness_seconds: 300
+  # Live venue selection. use_testnet=true routes live orders to Binance's spot
+  # testnet using BINANCE_TESTNET_API_KEY/SECRET from .env (no real money).
+  use_testnet: false
+  base_url: ""            # override the spot REST base URL entirely (rarely needed)
 
 risk:
   paper_initial_balance: 10000.0
   risk_per_trade_pct: 1.0
-  max_position_pct: 20.0
+  max_position_pct: 20.0       # HARD ceiling on a single entry (enforced in _qty_for)
   max_open_positions: 3
   cooldown_seconds: 300
-  max_daily_loss_pct: 3.0
+  max_daily_loss_pct: 3.0      # blocks NEW entries once today's realized loss hits this
+  enforce_daily_loss: true     # set false to disable the guard explicitly
   slippage_pct: 0.05
   trailing_stop_pct: 2.0       # trailing stop as % of entry price (0 = disabled)
+  # Resting exchange-side stop (live only). When enabled, a fill places a stop
+  # order ON the venue, so protection survives the bot process being killed.
+  exchange_stop_enabled: false
+  exchange_stop_limit_offset_pct: 0.1
+
+# --- Backtesting / research (see algotrading/backtest/) ---
+backtest:
+  fee_rate: 0.001            # per-side fee as a fraction of notional
+  slippage_pct: 0.05         # adverse fill applied to entry and exit
+  apply_risk_checks: false   # simulate cooldown / max positions / position caps
+  walk_forward_folds: 4
+  monte_carlo_runs: 200
+  bootstrap_runs: 200
+  random_seed: 42
+  max_candles: 20000         # row cap for a single replay
+
+# --- Parameter search (out-of-process; see algotrading/optimize/) ---
+optimize:
+  enabled: true
+  max_combinations: 200      # hard cap on grid/random candidates
+  timeout_seconds: 900       # wall-clock budget for the child process
+  min_trades: 10             # reject candidates with fewer trades
+  objective: sharpe          # sharpe | pnl_drawdown | total_pnl
+  trainer_python: ""         # interpreter for the search ("" = the bot's own)
+  nice: 10                   # child niceness so the 60s tick keeps its CPU
+  results_dir: data/optimize # repo-relative; artifacts land here
+
+# --- Outbound alerts (webhook; ALERT_WEBHOOK_URL in .env enables it) ---
+alerts:
+  enabled: false
+  webhook_url: ""
+  min_interval_seconds: 60
+  notify_signals: false
+  notify_fills: true
+  notify_risk: true
+  notify_errors: true
+
+# --- Portfolio analytics (exposure + correlation view) ---
+analytics:
+  portfolio_bars: 200
 
 schedule:
   market_tick_seconds: 60
@@ -49,12 +100,25 @@ ai:
   images_enabled: true    # accept Telegram photos/screenshots (needs USE_HERMES=true)
   image_max_bytes: 5000000  # reject larger uploads (phone storage + provider limits)
   image_dir: data/uploads # repo-relative; files are deleted right after the AI reads them
+  # Market news headlines for the advisory context (public RSS, no API key).
+  # Headline text is UNTRUSTED data: it is context for a proposal, never an
+  # instruction (chat hard rule 5).
+  news_enabled: false
+  news_feed_urls:
+    - https://cointelegraph.com/rss
+    - https://www.coindesk.com/arc/outboundfeeds/rss/
+  news_max_items: 8
+  news_timeout_seconds: 10
+  # Advisory decision log: what was proposed, what was approved, and how it did.
+  decision_log_enabled: true
+  decision_log_lessons: 5
 
 # --- Internal HTTP API (optional health/status; requires API_TOKEN in .env) ---
 api:
   enabled: false          # set true + API_TOKEN to expose /health and /status
   host: 127.0.0.1         # keep loopback; never expose to the public internet
   port: 8000
+  dashboard: true         # read-only HTML dashboard at "/" (still bearer-free, read-only)
 
 # --- Logging ---
 log_level: INFO

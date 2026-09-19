@@ -17,6 +17,8 @@ data/heartbeat
 data/backups/
 data/uploads/
 data/run_bot.lock
+data/exports/
+data/optimize/
 logs/*.log
 *.pid
 *.heartbeat

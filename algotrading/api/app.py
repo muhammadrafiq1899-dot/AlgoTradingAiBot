@@ -3,6 +3,16 @@
 Served from algotrading/main.py as a task on the same event loop (uvicorn).
 Reads the DB through a fresh session per request (from the shared session
 factory) so it never races the scheduler's threads.
+
+Endpoints fall into two groups and the split is deliberate:
+
+* open operational facts — ``/health`` (and ``/metrics`` when configured), no
+  token, nothing sensitive;
+* everything about trading state — ``/status``, ``/dashboard`` and the
+  ``/export/*`` downloads — behind ``require_token``.
+
+Every route here is GET and read-only: the API can observe the bot, never drive
+it (there is no state-changing endpoint, by design).
 """
 from __future__ import annotations
 
@@ -14,6 +24,7 @@ from fastapi import FastAPI, Response
 from sqlalchemy import select, text
 
 from algotrading.api.auth import require_token
+from algotrading.api.dashboard import collect_state, render_dashboard
 from algotrading.api.metrics import (
     init_metrics,
     get_metrics,
@@ -22,6 +33,13 @@ from algotrading.api.metrics import (
 from algotrading.config import Settings
 from algotrading.db import get_schema_version
 from algotrading.db.models import AIRecommendation, Candle, Position, Strategy, TradeIntent
+from algotrading.store.export import (
+    summary_dict,
+    summary_json_text,
+    trade_rows,
+    trades_csv_text,
+    trades_json_text,
+)
 from algotrading.supervisor.health import HealthMonitor
 from algotrading import __version__
 
@@ -173,5 +191,61 @@ def build_api(
             ],
             "pending_recommendations": len(pending),
         }
+
+    def _attachment(content: str, media_type: str, filename: str) -> Response:
+        """Read-only download response with an attachment filename.
+
+        The filename is a fixed constant per route (never derived from a query
+        parameter): nothing user-supplied reaches a header.
+        """
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # The dashboard is opt-out (`api.dashboard: false`). It is not registered at
+    # all when disabled, so the route 404s for everyone — a disabled feature
+    # should not advertise that it exists behind a token.
+    if settings.api.dashboard:
+        @app.get("/dashboard", dependencies=[require_token(token)])
+        def dashboard_endpoint() -> Response:
+            """Server-rendered read-only HTML page (no JS, no external assets)."""
+            with _session() as s:
+                state = collect_state(
+                    s,
+                    settings,
+                    health,
+                    uptime_seconds=int(time.time() - _STARTED),
+                )
+            return Response(
+                content=render_dashboard(state),
+                media_type="text/html",
+            )
+
+    @app.get("/export/trades.csv", dependencies=[require_token(token)])
+    def export_trades_csv_endpoint() -> Response:
+        """All trades as CSV."""
+        with _session() as s:
+            body = trades_csv_text(trade_rows(s))
+        return _attachment(body, "text/csv", "trades.csv")
+
+    @app.get("/export/trades.json", dependencies=[require_token(token)])
+    def export_trades_json_endpoint() -> Response:
+        """All trades as a JSON array."""
+        with _session() as s:
+            body = trades_json_text(trade_rows(s))
+        return _attachment(body, "application/json", "trades.json")
+
+    @app.get("/export/summary.json", dependencies=[require_token(token)])
+    def export_summary_endpoint() -> Response:
+        """Counts, totals, latest analytics and mode/strategy metadata."""
+        with _session() as s:
+            summary = summary_dict(
+                s,
+                mode=settings.mode,
+                initial_balance=float(settings.risk.paper_initial_balance),
+            )
+        return _attachment(summary_json_text(summary), "application/json", "summary.json")
 
     return app

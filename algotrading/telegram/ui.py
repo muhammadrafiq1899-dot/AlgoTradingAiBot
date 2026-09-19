@@ -453,6 +453,109 @@ def format_backtest_comparison(
     )
 
 
+# --- portfolio + news (read-only surfaces) -----------------------------------
+
+def _short_symbol(symbol: str) -> str:
+    """``BTC/USDT`` -> ``BTC`` for narrow monospace tables."""
+    return str(symbol or "").split("/")[0]
+
+
+def _correlation_table(correlation: dict) -> list[str]:
+    """Monospace matrix of the included symbols (n/a = undefined pair)."""
+    symbols = correlation.get("symbols") or []
+    matrix = correlation.get("matrix") or {}
+    if len(symbols) < 2:
+        return []
+    labels = [_short_symbol(s) for s in symbols]
+    label_w = max(len(label) for label in labels)
+    col_w = max(5, label_w)
+
+    lines = [" " * label_w + "  " + "  ".join(f"{label:>{col_w}}" for label in labels)]
+    for a in symbols:
+        cells = []
+        for b in symbols:
+            if a == b:
+                cells.append(f"{'1.00':>{col_w}}")
+                continue
+            value = (matrix.get(a) or {}).get(b)
+            cells.append(f"{'n/a':>{col_w}}" if value is None else f"{value:>+{col_w}.2f}")
+        lines.append(f"{_short_symbol(a):<{label_w}}  " + "  ".join(cells))
+    return ["<pre>" + html.escape("\n".join(lines)) + "</pre>"]
+
+
+def format_portfolio(snapshot: dict) -> str:
+    """Exposure block + correlation matrix for /portfolio.
+
+    Correlation is labelled in the message itself as descriptive context from
+    stored candles (it lags) and explicitly not a trading signal — the reader
+    must not mistake it for advice.
+    """
+    rows = snapshot.get("positions") or []
+    balance = snapshot.get("balance") or 0.0
+    lines = ["<b>Portfolio</b>"]
+
+    if rows:
+        lines.append(
+            f"{snapshot.get('open_positions', len(rows))} open · "
+            f"exposure {_fmt_price(snapshot.get('total_exposure'))} "
+            f"({snapshot.get('total_pct_of_balance', 0.0):.1f}% of balance "
+            f"{_fmt_price(balance)})"
+        )
+        for row in rows:
+            last = row.get("last_price")
+            lines.append(
+                f"• {html.escape(str(row.get('symbol', '?')))}: "
+                f"{_fmt_price(row.get('qty'), 6)} @ {_fmt_price(row.get('avg_price'))}"
+                + (f" → {_fmt_price(last)}" if last else " → no stored price")
+                + f", notional {_fmt_price(row.get('notional'))} "
+                f"({row.get('pct_of_balance', 0.0):.1f}%)"
+            )
+    else:
+        lines.append("No open positions.")
+
+    correlation = snapshot.get("correlation") or {}
+    table = _correlation_table(correlation)
+    lines.append("")
+    lines.append(
+        f"<b>Correlation</b> ({html.escape(str(correlation.get('interval', '?')))} closes, "
+        f"last {correlation.get('bars', '?')} bars)"
+    )
+    if table:
+        lines.extend(table)
+    else:
+        lines.append("Not enough stored candles for two symbols yet.")
+    lines.append(
+        "<i>Descriptive risk context from stored candles (lags the market) — "
+        "not a trading signal.</i>"
+    )
+    skipped = correlation.get("skipped") or {}
+    if skipped:
+        detail = ", ".join(
+            f"{html.escape(str(name))} ({html.escape(str(reason))})"
+            for name, reason in sorted(skipped.items())
+        )
+        lines.append(f"Skipped: {detail}")
+    return _fit(lines)
+
+
+def format_news(headlines) -> str:
+    """Headline list for /news. Third-party text: escaped, never interpreted."""
+    lines = ["<b>News headlines</b> <i>(untrusted third-party data)</i>"]
+    items = list(headlines or [])
+    if not items:
+        lines.append("No headlines available right now (feeds empty or unreachable).")
+        return "\n".join(lines)
+    for item in items:
+        title = html.escape(" ".join(str(getattr(item, "title", item) or "").split()))
+        if not title:
+            continue
+        url = str(getattr(item, "url", "") or "")
+        source = html.escape(str(getattr(item, "source", "") or ""))
+        headline = f'<a href="{html.escape(url, quote=True)}">{title}</a>' if url else title
+        lines.append(f"• {headline}" + (f" — {source}" if source else ""))
+    return _fit(lines)
+
+
 def format_summary(summaries, session) -> str:
     """Analytics summaries (M5); placeholder until service lands."""
     if not summaries:

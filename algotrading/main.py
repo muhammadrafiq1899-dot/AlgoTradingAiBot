@@ -29,6 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from algotrading.alerts import configure_alerter  # noqa: E402
 from algotrading.config import Settings, load_settings, validate_settings  # noqa: E402
 from algotrading.db import get_session, get_session_factory, init_db  # noqa: E402
 from algotrading.db.seed import ensure_seeded  # noqa: E402
@@ -181,6 +182,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     settings = load_settings()
     validate_settings(settings)
+    # Wire the outbound alert channel before any job can fire: the default
+    # alerter is a no-op, so an unconfigured bot silently drops alerts rather
+    # than failing on them.
+    configure_alerter(settings)
     setup_logging(
         log_level=settings.log_level,
         log_dir=settings.log_dir,

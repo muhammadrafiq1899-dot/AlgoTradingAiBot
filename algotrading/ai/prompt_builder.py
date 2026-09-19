@@ -1,15 +1,27 @@
 """Deterministic prompt assembly for the AI assistant.
 
-The assistant is strictly advisory: it sees analytics summaries and recent
-candle feature windows (read-only analytical inputs) and is asked to emit a
-structured recommendation. The prompt is built entirely from local data so the
-same inputs always produce the same prompt (no time-of-day drift beyond what
-the data itself changes).
+The assistant is strictly advisory: it sees analytics summaries, recent candle
+feature windows and (when enabled) decision-log lessons + public news headlines
+(read-only analytical inputs) and is asked to emit a structured
+recommendation. The prompt is built entirely from local data so the same inputs
+always produce the same prompt (no time-of-day drift beyond what the data itself
+changes).
+
+Two optional blocks, both **data, never instructions**:
+
+* ``lessons`` — the assistant's own past decisions and their realized outcomes
+  (``ai/decision_log.build_lessons``), so it can avoid repeating a change that
+  already failed. It is memory, not a permission: nothing in it can make the
+  assistant act.
+* ``headlines`` — public RSS titles, rendered behind an explicit untrusted-data
+  header (``ai/news.UNTRUSTED_HEADER``, mirroring chat hard rule 5). Only ever
+  passed in when ``ai.news_enabled`` is set.
 """
 from __future__ import annotations
 
 from typing import Any, Sequence
 
+from algotrading.ai.news import format_headlines
 from algotrading.market.base import Candle
 
 SYSTEM_PROMPT = (
@@ -70,6 +82,27 @@ def _summaries_block(summaries: Sequence[Any]) -> str:
     return "\n".join(lines)
 
 
+def _lessons_block(lessons: Sequence[str]) -> str:
+    """Render the advisory decision-log lines (deterministic, no LLM call)."""
+    lines = [f"- {line}" for line in lessons if str(line or "").strip()]
+    if not lines:
+        return ""
+    return (
+        "Lessons from your own past decisions (realized outcomes; advisory "
+        "memory only — you still cannot trade or apply anything):\n"
+        + "\n".join(lines)
+    )
+
+
+def _headlines_block(headlines: Any) -> str:
+    """Render news headlines as untrusted data, or "" when there are none."""
+    if not headlines:
+        return ""
+    if isinstance(headlines, str):
+        return headlines.strip()
+    return format_headlines(headlines)
+
+
 def build_prompt(
     symbol: str,
     interval: str,
@@ -78,6 +111,8 @@ def build_prompt(
     strategy_name: str,
     params: dict[str, Any],
     max_feature_rows: int = 24,
+    lessons: Sequence[str] | None = None,
+    headlines: Any = None,
 ) -> list[dict[str, str]]:
     """Build the chat messages for the LLM.
 
@@ -88,6 +123,11 @@ def build_prompt(
         candles: recent Candle rows (oldest -> newest).
         strategy_name: currently active strategy.
         params: current strategy params (the "parameter diff" baseline).
+        lessons: decision-log lines (see ``ai/decision_log.build_lessons``) or
+            None/[] to omit the block entirely.
+        headlines: ``Headline`` objects, plain strings, or an already-formatted
+            block. Only passed by the caller when ``ai.news_enabled`` is true —
+            this function never fetches anything.
     """
     feature_rows = build_feature_window(candles, max_rows=max_feature_rows)
     feature_block = "\n".join(feature_rows) if feature_rows else "  (no candles available)"
@@ -98,6 +138,17 @@ def build_prompt(
         f"Symbol: {symbol}  Interval: {interval}\n\n"
         f"Recent analytics summaries:\n{_summaries_block(summaries)}\n\n"
         f"Recent price candles (oldest -> newest, latest excluded):\n{feature_block}\n\n"
+    )
+
+    lessons_block = _lessons_block(list(lessons or []))
+    if lessons_block:
+        user_prompt += f"{lessons_block}\n\n"
+
+    headlines_block = _headlines_block(headlines)
+    if headlines_block:
+        user_prompt += f"{headlines_block}\n\n"
+
+    user_prompt += (
         "Propose at most one change. If you believe the current strategy is "
         "fine, return kind=\"hypothesis\" with an empty params diff and a "
         "rationale explaining why. Return ONLY the JSON object."

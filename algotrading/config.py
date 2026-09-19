@@ -26,9 +26,16 @@ class MarketConfig(BaseModel):
     exchange: str = "binance"
     symbols: list[str] = ["BTC/USDT", "ETH/USDT"]
     intervals: list[str] = ["1m", "1h"]
+    # Interval the strategy engine evaluates. None = legacy behaviour ("1h" when
+    # configured, else the first interval). Set it explicitly for scalping.
+    eval_interval: str | None = None
     backfill_days: int = 30
     poll_seconds: int = 60
     max_staleness_seconds: int = 300  # freeze new entries if data older than this
+    # Venue selection: testnet keeps the live code path but against Binance's
+    # spot testnet (BINANCE_TESTNET_API_KEY/SECRET). base_url overrides entirely.
+    use_testnet: bool = False
+    base_url: str = ""
 
 
 class RiskConfig(BaseModel):
@@ -37,9 +44,50 @@ class RiskConfig(BaseModel):
     max_position_pct: float = 20.0           # max single-position fraction of balance
     max_open_positions: int = 3
     cooldown_seconds: int = 300              # min gap between entries on a symbol
-    max_daily_loss_pct: float = 3.0          # stop bot if daily loss exceeds this
+    max_daily_loss_pct: float = 3.0          # stop new entries if daily loss exceeds this
+    enforce_daily_loss: bool = True          # set false to disable the guard explicitly
     slippage_pct: float = 0.05               # paper fill slippage
     trailing_stop_pct: float = 0.0           # trailing stop % (0 = disabled)
+    # Resting exchange-side stop (live only). Protective stops then survive the
+    # bot process dying, instead of being re-derived from a signal every tick.
+    exchange_stop_enabled: bool = False
+    exchange_stop_limit_offset_pct: float = 0.1  # limit offset below a stop-loss-limit
+
+
+class BacktestConfig(BaseModel):
+    fee_rate: float = 0.001          # per-side cost as a fraction of notional
+    slippage_pct: float = 0.05       # adverse fill on entry and exit
+    apply_risk_checks: bool = False  # simulate cooldown/max positions/caps
+    walk_forward_folds: int = 4
+    monte_carlo_runs: int = 200
+    bootstrap_runs: int = 200
+    random_seed: int = 42
+    max_candles: int = 20_000        # row cap for one replay
+
+
+class OptimizeConfig(BaseModel):
+    enabled: bool = True
+    max_combinations: int = 200      # hard cap on grid/random candidates
+    timeout_seconds: int = 900       # wall-clock budget for the child process
+    min_trades: int = 10             # candidates below this are rejected outright
+    objective: Literal["sharpe", "pnl_drawdown", "total_pnl"] = "sharpe"
+    trainer_python: str = ""         # interpreter for the search ("" = this one)
+    nice: int = 10                   # child niceness, so the tick keeps its CPU
+    results_dir: str = "data/optimize"  # repo-relative; resolved at load time
+
+
+class AlertsConfig(BaseModel):
+    enabled: bool = False
+    webhook_url: str = ""            # from ALERT_WEBHOOK_URL in .env
+    min_interval_seconds: int = 60   # rate limit per event kind
+    notify_signals: bool = False
+    notify_fills: bool = True
+    notify_risk: bool = True
+    notify_errors: bool = True
+
+
+class AnalyticsConfig(BaseModel):
+    portfolio_bars: int = 200        # candles behind the exposure/correlation view
 
 
 class ScheduleConfig(BaseModel):
@@ -64,12 +112,27 @@ class AIConfig(BaseModel):
     images_enabled: bool = True
     image_max_bytes: int = 5_000_000
     image_dir: str = "data/uploads"   # repo-relative; resolved at load time
+    # Market news headlines for the advisory context (public RSS, no API key).
+    news_enabled: bool = False
+    news_feed_urls: list[str] = Field(
+        default_factory=lambda: [
+            "https://cointelegraph.com/rss",
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        ]
+    )
+    news_max_items: int = 8
+    news_timeout_seconds: int = 10
+    # Advisory decision log: what the AI proposed, what was approved, and how it
+    # performed afterwards — fed back into the next review as lessons.
+    decision_log_enabled: bool = True
+    decision_log_lessons: int = 5
 
 
 class ApiConfig(BaseModel):
     enabled: bool = False
     host: str = "127.0.0.1"
     port: int = 8000
+    dashboard: bool = True  # read-only HTML dashboard at "/"
 
 
 class LogConfig(BaseModel):
@@ -113,6 +176,10 @@ class Settings(BaseModel):
     mode: Literal["paper", "live"] = "paper"
     market: MarketConfig = Field(default_factory=MarketConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    optimize: OptimizeConfig = Field(default_factory=OptimizeConfig)
+    alerts: AlertsConfig = Field(default_factory=AlertsConfig)
+    analytics: AnalyticsConfig = Field(default_factory=AnalyticsConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
@@ -160,6 +227,12 @@ def load_settings(
         for p in settings.modules.strategy_plugin_paths
     ]
 
+    # Optimizer artifact dir: same Termux rule (never relative to the CWD).
+    opt_dir = Path(settings.optimize.results_dir)
+    settings.optimize.results_dir = str(
+        opt_dir if opt_dir.is_absolute() else PROJECT_ROOT / opt_dir
+    )
+
     # Merge .env secrets
     if os.getenv("TELEGRAM_ALLOWED_USERS"):
         ids = [
@@ -187,6 +260,15 @@ def load_settings(
     _secrets["binance_testnet_secret"] = os.getenv("BINANCE_TESTNET_API_SECRET", "")
     _secrets["telegram_token"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
     _secrets["api_token"] = os.getenv("API_TOKEN", "")
+    _secrets["alert_webhook_url"] = os.getenv("ALERT_WEBHOOK_URL", "")
+
+    # A configured webhook turns the alert channel on; an explicit
+    # `alerts.enabled: false` in settings.yaml is still honoured.
+    if _secrets["alert_webhook_url"] and not settings.alerts.enabled:
+        settings.alerts.enabled = True
+    settings.alerts.webhook_url = os.getenv(
+        "ALERT_WEBHOOK_URL", settings.alerts.webhook_url
+    )
 
     return settings
 
@@ -287,13 +369,21 @@ def validate_settings(settings: Settings) -> None:
     - AI config is valid when enabled
     - API config is valid when enabled
     """
-    # Live mode requires keys
+    # Live mode requires keys for the venue actually selected. A testnet-only
+    # setup must not be forced to hold mainnet credentials just to boot.
     if settings.mode == "live":
-        binance_key = _secrets.get("binance_api_key", "")
-        binance_secret = _secrets.get("binance_api_secret", "")
+        if settings.market.use_testnet:
+            binance_key = _secrets.get("binance_testnet_key", "")
+            binance_secret = _secrets.get("binance_testnet_secret", "")
+            required = "BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET"
+        else:
+            binance_key = _secrets.get("binance_api_key", "")
+            binance_secret = _secrets.get("binance_api_secret", "")
+            required = "BINANCE_API_KEY and BINANCE_API_SECRET"
         if not binance_key or not binance_secret:
+            venue = "testnet (market.use_testnet: true)" if settings.market.use_testnet else "mainnet"
             raise RuntimeError(
-                "LIVE mode requires BINANCE_API_KEY and BINANCE_API_SECRET in .env"
+                f"LIVE mode on {venue} requires {required} in .env"
             )
 
     # Risk parameter bounds
@@ -312,6 +402,8 @@ def validate_settings(settings: Settings) -> None:
         raise ValueError("risk.slippage_pct must be in [0, 10]")
     if not 0 <= risk.trailing_stop_pct <= 100:
         raise ValueError("risk.trailing_stop_pct must be in [0, 100]")
+    if not 0 <= risk.exchange_stop_limit_offset_pct <= 10:
+        raise ValueError("risk.exchange_stop_limit_offset_pct must be in [0, 10]")
     if risk.paper_initial_balance <= 0:
         raise ValueError("risk.paper_initial_balance must be > 0")
 
@@ -366,6 +458,58 @@ def validate_settings(settings: Settings) -> None:
         )
     if market.backfill_days < 1:
         raise ValueError("market.backfill_days must be >= 1")
+    if market.eval_interval is not None:
+        from algotrading.market.candles import INTERVAL_MS
+
+        if market.eval_interval not in market.intervals:
+            raise ValueError(
+                "market.eval_interval must be one of market.intervals "
+                f"({market.intervals})"
+            )
+        if market.eval_interval not in INTERVAL_MS:
+            raise ValueError(
+                f"market.eval_interval {market.eval_interval!r} is not a known "
+                f"interval ({sorted(INTERVAL_MS)})"
+            )
+
+    # Backtest / optimizer budgets
+    bt = settings.backtest
+    if not 0 <= bt.fee_rate < 0.1:
+        raise ValueError("backtest.fee_rate must be in [0, 0.1)")
+    if not 0 <= bt.slippage_pct <= 10:
+        raise ValueError("backtest.slippage_pct must be in [0, 10]")
+    if not 2 <= bt.walk_forward_folds <= 20:
+        raise ValueError("backtest.walk_forward_folds must be in [2, 20]")
+    for name in ("monte_carlo_runs", "bootstrap_runs"):
+        if getattr(bt, name) < 0:
+            raise ValueError(f"backtest.{name} must be >= 0")
+    if bt.max_candles < 100:
+        raise ValueError("backtest.max_candles must be >= 100")
+
+    opt = settings.optimize
+    if opt.max_combinations < 1:
+        raise ValueError("optimize.max_combinations must be >= 1")
+    if opt.timeout_seconds < 10:
+        raise ValueError("optimize.timeout_seconds must be >= 10")
+    if opt.min_trades < 0:
+        raise ValueError("optimize.min_trades must be >= 0")
+    if not 0 <= opt.nice <= 19:
+        raise ValueError("optimize.nice must be in [0, 19]")
+
+    # Alerts
+    alerts = settings.alerts
+    if alerts.enabled and not alerts.webhook_url:
+        raise ValueError(
+            "alerts.enabled=true requires alerts.webhook_url or ALERT_WEBHOOK_URL in .env"
+        )
+    if alerts.webhook_url and not alerts.webhook_url.startswith(("http://", "https://")):
+        raise ValueError("alerts.webhook_url must be an http(s) URL")
+    if alerts.min_interval_seconds < 0:
+        raise ValueError("alerts.min_interval_seconds must be >= 0")
+
+    # Portfolio analytics
+    if settings.analytics.portfolio_bars < 10:
+        raise ValueError("analytics.portfolio_bars must be >= 10")
 
     # Telegram
     if not _secrets.get("telegram_token") and settings.telegram_allowed_users:

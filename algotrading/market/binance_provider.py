@@ -1,17 +1,27 @@
-"""Binance market data provider backed by the lightweight REST client."""
+"""Binance market data provider backed by the lightweight REST client.
+
+The provider serves whatever venue its client points at. Callers that must
+match the order venue (the builtin `market.binance` module) build the client
+from settings via `BinanceRestClient.from_settings`; the default here is
+mainnet, which is only right for paper mode against mainnet prices.
+"""
 from __future__ import annotations
 
+import logging
 import time
 
 from algotrading.market.base import Candle, MarketDataProvider
 from algotrading.market.binance_rest import BinanceRestClient
 from algotrading.market.circuit_breaker import CircuitBreaker, CircuitOpenError, get_circuit
 
+log = logging.getLogger(__name__)
+
 
 class BinanceMarketProvider(MarketDataProvider):
     """Read-only market data from Binance Spot via REST (public endpoints).
 
-    No API keys required for klines/ticker, so this works in paper and live.
+    No API keys required for klines/ticker, so this works in paper and live —
+    including the spot testnet, whose public endpoints are open too.
     """
 
     def __init__(self, client: BinanceRestClient | None = None, circuit_breaker: CircuitBreaker | None = None) -> None:

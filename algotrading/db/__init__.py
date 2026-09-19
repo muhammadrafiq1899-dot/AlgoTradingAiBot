@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 
 # Bump when you change models and need a migration. Simple, versioned migrations
 # can be added to apply() as the schema evolves.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @lru_cache(maxsize=1)
@@ -84,6 +84,48 @@ def _run_migrations(session: Session, from_version: int, to_version: int) -> Non
             session.execute(text("ALTER TABLE positions ADD COLUMN highest_price FLOAT"))
         session.commit()
         log.info("Applied migration v1 -> v2: added trailing_stop_price and highest_price to positions table")
+
+    if from_version < 3 <= to_version:
+        # Migration v2 -> v3: advisory decision log (ai_decision_log).
+        # create_all() above already adds a *missing* table to an existing DB,
+        # so this is the safety net for the two cases create_all cannot cover:
+        # a table that exists but predates a column, and a DB whose version row
+        # was written by a build that had the table but no index.
+        _ensure_decision_log(session)
+        log.info("Applied migration v2 -> v3: ensured ai_decision_log table")
+
+
+def _ensure_decision_log(session: Session) -> None:
+    """Create/patch ``ai_decision_log`` without touching existing data.
+
+    Additive only: either the table is created, or missing columns are appended
+    with ``ALTER TABLE ... ADD COLUMN``. Nothing is ever dropped or rewritten —
+    an existing database keeps every row it had.
+    """
+    from sqlalchemy import text
+
+    from algotrading.db.models import AIDecisionLog
+
+    bind = session.get_bind()
+    cols = session.execute(text("PRAGMA table_info(ai_decision_log)")).fetchall()
+    if not cols:
+        # ``__table__`` is a real sqlalchemy Table at runtime (the declared type
+        # on the declarative class is FromClause, hence the ignore).
+        AIDecisionLog.__table__.create(bind, checkfirst=True)  # type: ignore[attr-defined]
+        session.commit()
+        return
+
+    existing = {c[1] for c in cols}
+    for column in AIDecisionLog.__table__.columns:
+        if column.name in existing:
+            continue
+        # SQLite types come from the ORM column so the added column matches a
+        # freshly created table exactly.
+        session.execute(
+            text(f"ALTER TABLE ai_decision_log ADD COLUMN {column.name} {column.type}")
+        )
+        log.info("ai_decision_log: added missing column %s", column.name)
+    session.commit()
 
 
 def get_schema_version(db_path: str = "data/algotrading.db") -> int:

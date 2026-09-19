@@ -8,8 +8,12 @@ Job roster (all max_instances=1 + coalesce, so slow ticks never stack):
 
   - market_tick:    fetch candles -> store -> evaluate active strategy -> execute
   - analytics_tick: 30m snapshot of closed-trade metrics
-  - analytics_daily: midnight-UTC daily summary
+  - analytics_daily: midnight-UTC daily summary (+ advisory decision log)
   - ai_review:      daily AI proposal (PENDING only, never applied)
+  - decision_log_tick: advisory-memory upkeep — records applied recommendations,
+                    fills in realized outcomes once the horizon elapsed, and
+                    refreshes reflections. Runs inside the two daily jobs; it
+                    is never read by the execution path.
   - reconcile_tick: local intents vs exchange open orders
   - heartbeat_tick: touch heartbeat file for the external watchdog
 
@@ -36,13 +40,19 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from algotrading.analytics.service import AnalyticsService
 from algotrading.ai.assistant import Assistant
 from algotrading.ai.client import AIClient
+from algotrading.ai.decision_log import (
+    DEFAULT_HORIZON_DAYS,
+    evaluate_due,
+    reflect,
+    sync_applied,
+)
 from algotrading.config import Settings
 from algotrading.db.models import AnalyticsSummary, AIRecommendation
 from algotrading.execution import ExecutionEngine, RiskManager
 from algotrading.execution.base import ExchangeGateway
 from algotrading.ledger import Ledger
 from algotrading.market.base import Candle, MarketDataProvider
-from algotrading.market.candles import CandleStore
+from algotrading.market.candles import CandleStore, INTERVAL_MS
 from algotrading.store.recommendations import RecommendationStore
 from algotrading.strategy.engine import StrategyEngine
 from algotrading.supervisor.health import HealthMonitor
@@ -108,8 +118,17 @@ class BotContext:
         return capability in self.services
 
     def primary_interval(self) -> str:
-        """Interval used for strategy evaluation: '1h' if configured, else first."""
+        """Interval used for strategy evaluation.
+
+        `market.eval_interval` wins when set. Otherwise the legacy rule applies
+        ("1h" if configured, else the first interval) — which meant that with
+        the shipped interval list the engine evaluated **1h** no matter which
+        timeframe you intended to trade.
+        """
         intervals = self.settings.market.intervals
+        explicit = getattr(self.settings.market, "eval_interval", None)
+        if explicit:
+            return explicit
         return "1h" if "1h" in intervals else (intervals[0] if intervals else "1m")
 
 
@@ -120,6 +139,24 @@ def _open_session(ctx: BotContext):
         yield session
     finally:
         session.close()
+
+
+def stale_data(
+    settings: Settings,
+    newest_ts: int,
+    eval_interval: str,
+    now_ms: float | None = None,
+) -> bool:
+    """Is the newest stored candle too old to allow new entries?
+
+    Allowance = the interval's own length + `market.max_staleness_seconds`. The
+    interval length comes from the shared `INTERVAL_MS` table, so a 15m/4h/1d
+    evaluation window is judged by its own clock instead of the old
+    ``1h else 1m`` hardcode (which froze entries permanently off 1h/1m).
+    """
+    interval_ms = INTERVAL_MS.get(eval_interval, 60_000)
+    now = time.time() * 1000 if now_ms is None else now_ms
+    return now - newest_ts > interval_ms + settings.market.max_staleness_seconds * 1000
 
 
 # --- market tick -------------------------------------------------------------
@@ -162,12 +199,15 @@ def market_tick(ctx: BotContext) -> None:
         if newest_ts is None:
             log.warning("market tick: no %s candles stored yet; skipping evaluation", eval_interval)
             return
-        staleness_ms = settings.market.max_staleness_seconds * 1000
-        interval_ms = 3_600_000 if eval_interval == "1h" else 60_000
-        if time.time() * 1000 - newest_ts > interval_ms + staleness_ms:
+        # Interval length comes from the shared table, not from a two-branch
+        # hardcode: the old `1h else 1m` arithmetic froze entries permanently
+        # for 15m/30m/4h/1d and barely passed for 5m.
+        if stale_data(settings, newest_ts, eval_interval):
+            age_s = int((time.time() * 1000 - newest_ts) / 1000)
             log.warning(
-                "market tick: data stale (%ds old); freezing new entries",
-                int((time.time() * 1000 - newest_ts) / 1000),
+                "market tick: data stale (%ds old, %s interval); freezing new entries",
+                age_s,
+                eval_interval,
             )
             return
 
@@ -270,12 +310,72 @@ def analytics_tick(ctx: BotContext) -> None:
 
 
 def analytics_daily(ctx: BotContext) -> None:
-    """Daily summary since UTC midnight."""
+    """Daily summary since UTC midnight + advisory decision-log maintenance."""
     session = ctx.session_factory()
     try:
         AnalyticsService(session).run_daily()
     finally:
         session.close()
+    # The log advances even when the assistant is switched off: recommendations
+    # applied while it was on still deserve a realized-outcome record.
+    decision_log_tick(ctx)
+
+
+# --- advisory decision log ---------------------------------------------------
+
+def decision_log_tick(ctx: BotContext) -> None:
+    """Record applied recommendations, evaluate the due ones, refresh reflections.
+
+    Runs daily (from ``analytics_daily`` and again from ``ai_review`` so the
+    lessons in the prompt are current). Everything here is advisory memory:
+    no result is read by the execution path, and nothing in it can change the
+    active strategy, params or mode.
+
+    Why here and not in ``RecommendationStore.apply``: that module is owned by
+    another change, so the approval is *observed* on the next daily tick
+    (``sync_applied``) instead of being pushed at apply time. Same rows, one day
+    of latency at worst.
+
+    Never raises: a failure is logged (and alerted best-effort) so the daily
+    analytics job and the AI review are unaffected.
+    """
+    settings = ctx.settings
+    ai = getattr(settings, "ai", None)
+    if ai is None or not getattr(ai, "decision_log_enabled", True):
+        return
+    symbols = list(getattr(settings.market, "symbols", None) or [])
+    session = ctx.session_factory()
+    try:
+        recorded = sync_applied(session, horizon_days=DEFAULT_HORIZON_DAYS)
+        evaluated = evaluate_due(
+            session,
+            DEFAULT_HORIZON_DAYS,
+            benchmark_symbol=(symbols[0] if symbols else None),
+            benchmark_interval=ctx.primary_interval(),
+        )
+        reflected = reflect(session, limit=20)
+        if recorded or evaluated:
+            log.info(
+                "decision log: %d recorded, %d evaluated, %d reflection(s) updated",
+                len(recorded),
+                len(evaluated),
+                len(reflected),
+            )
+    except Exception as exc:  # noqa: BLE001 - advisory memory must never break a job
+        log.exception("decision log tick failed")
+        _alert_error("Decision log failed", str(exc))
+    finally:
+        session.close()
+
+
+def _alert_error(title: str, body: str = "") -> None:
+    """Best-effort owner alert; never raises (notifications are optional)."""
+    try:
+        from algotrading.alerts import notify
+
+        notify("error", title, body)
+    except Exception:  # noqa: BLE001
+        log.debug("error alert not delivered", exc_info=True)
 
 
 # --- AI review ---------------------------------------------------------------
@@ -287,6 +387,9 @@ def ai_review(ctx: BotContext) -> None:
     (one open question at a time — the user must approve/reject before the
     next proposal). The assistant never applies anything itself.
     """
+    # Refresh the advisory decision log first, so this review's prompt carries
+    # the outcomes of earlier decisions (memory, never a permission).
+    decision_log_tick(ctx)
     if not ctx.settings.ai.enabled:
         return
     session = ctx.session_factory()

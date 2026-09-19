@@ -1,6 +1,7 @@
 """Analytics metric math + summary persistence."""
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -11,7 +12,7 @@ from algotrading.analytics.metrics import (
 )
 from algotrading.analytics.service import AnalyticsService
 from algotrading.db import init_db, get_session_factory
-from algotrading.db.models import Trade
+from algotrading.db.models import Strategy, Trade
 
 
 def _trade(pnl, entry=100.0, exit_=None, fees=0.0, opened=None, closed=None,
@@ -126,3 +127,117 @@ def test_daily_summary(session):
     m = json.loads(summary.metrics_json)
     assert m["period"] == "daily"
     assert m["n_trades"] == 2
+
+
+# --- P3: the daily job also maintains the advisory decision log ---------------
+
+def _bot_context(db: str, *, decision_log_enabled: bool = True):
+    from algotrading.config import AIConfig, MarketConfig, RiskConfig, Settings
+    from algotrading.scheduler.jobs import BotContext
+    from algotrading.supervisor.health import HealthMonitor
+
+    settings = Settings(
+        mode="paper",
+        market=MarketConfig(symbols=["BTC/USDT"], intervals=["1h"], max_staleness_seconds=300),
+        risk=RiskConfig(paper_initial_balance=100_000.0),
+        ai=AIConfig(enabled=False, decision_log_enabled=decision_log_enabled),
+    )
+    return BotContext(
+        settings=settings,
+        session_factory=get_session_factory(db),
+        provider=None,
+        gateway=None,
+        health=HealthMonitor(str(Path(db).with_name("heartbeat"))),
+    )
+
+
+def test_analytics_daily_maintains_the_decision_log(tmp_path):
+    """The daily job observes approvals another module owns and scores them."""
+    from algotrading.ai.decision_log import PENDING, WIN
+    from algotrading.db.models import AIDecisionLog, AIRecommendation, Candle as CandleRow
+    from algotrading.scheduler.jobs import analytics_daily
+
+    db = str(tmp_path / "daily.db")
+    init_db(db)
+    ctx = _bot_context(db)
+
+    applied_at = datetime.now(timezone.utc) - timedelta(days=10)
+    sess = ctx.session_factory()
+    sess.add(Strategy(name="ema_crossover", version=1, status="active"))
+    rec = AIRecommendation(kind="param_change", strategy_name="ema_crossover",
+                           content_json="{}", status="applied", reviewed_at=applied_at)
+    sess.add(rec)
+    sess.add(_trade(10.0, closed=applied_at + timedelta(days=3)))
+    start_ms = int((applied_at - timedelta(hours=1)).timestamp() * 1000)
+    for i, close in enumerate([100.0, 100.0, 99.0]):
+        sess.add(CandleRow(symbol="BTC/USDT", interval="1h", ts=start_ms + i * 3_600_000,
+                           open=close, high=close, low=close, close=close, volume=1.0))
+    sess.commit()
+    sess.close()
+    assert rec.id is not None
+
+    analytics_daily(ctx)
+
+    sess = ctx.session_factory()
+    try:
+        entry = sess.query(AIDecisionLog).one()
+        assert entry.recommendation_id == rec.id
+        assert entry.outcome == WIN
+        assert entry.pnl_pct == pytest.approx(10.0)
+        assert entry.benchmark_pct == pytest.approx(-1.0)
+        assert entry.reflection
+    finally:
+        sess.close()
+
+
+def test_decision_log_tick_leaves_an_unelapsed_horizon_pending(tmp_path):
+    from algotrading.ai.decision_log import PENDING
+    from algotrading.db.models import AIDecisionLog, AIRecommendation
+    from algotrading.scheduler.jobs import decision_log_tick
+
+    db = str(tmp_path / "pending.db")
+    init_db(db)
+    ctx = _bot_context(db)
+
+    sess = ctx.session_factory()
+    sess.add(Strategy(name="ema_crossover", version=1, status="active"))
+    sess.add(AIRecommendation(kind="param_change", strategy_name="ema_crossover",
+                              content_json="{}", status="applied",
+                              reviewed_at=datetime.now(timezone.utc) - timedelta(days=1)))
+    sess.commit()
+    sess.close()
+
+    decision_log_tick(ctx)
+
+    sess = ctx.session_factory()
+    try:
+        entry = sess.query(AIDecisionLog).one()
+        assert entry.outcome == PENDING          # recorded, not yet judged
+        assert entry.evaluated_at is None
+    finally:
+        sess.close()
+
+
+def test_decision_log_tick_disabled_does_nothing(tmp_path):
+    from algotrading.db.models import AIDecisionLog, AIRecommendation
+    from algotrading.scheduler.jobs import decision_log_tick
+
+    db = str(tmp_path / "disabled.db")
+    init_db(db)
+    ctx = _bot_context(db, decision_log_enabled=False)
+
+    sess = ctx.session_factory()
+    sess.add(Strategy(name="ema_crossover", version=1, status="active"))
+    sess.add(AIRecommendation(kind="param_change", strategy_name="ema_crossover",
+                              content_json="{}", status="applied",
+                              reviewed_at=datetime.now(timezone.utc) - timedelta(days=30)))
+    sess.commit()
+    sess.close()
+
+    decision_log_tick(ctx)
+
+    sess = ctx.session_factory()
+    try:
+        assert sess.query(AIDecisionLog).count() == 0
+    finally:
+        sess.close()

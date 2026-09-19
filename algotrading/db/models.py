@@ -178,6 +178,45 @@ class AIRecommendation(Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AIDecisionLog(Base):
+    """Advisory memory: what the AI proposed, was approved, and how it did.
+
+    One row per APPLIED recommendation. Rows are written when the approval is
+    observed (``record_applied``) and filled in later by ``evaluate_due`` once
+    the review horizon has elapsed, using *realized* trades — never a
+    projection. This table is purely advisory memory: nothing here is read by
+    the execution path, it only feeds ``build_lessons`` back into the next
+    advisory prompt.
+    """
+
+    __tablename__ = "ai_decision_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Nullable on purpose: a log row outlives its recommendation if that row is
+    # ever cleaned up, and losing the memory would be worse than a dangling id.
+    recommendation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ai_recommendations.id"), nullable=True
+    )
+    strategy_name: Mapped[str] = mapped_column(String(64), default="")
+    kind: Mapped[str] = mapped_column(String(24), default="")
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    evaluated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    horizon_days: Mapped[int] = mapped_column(Integer, default=7)
+    # pending | win | loss | flat — "pending" means the horizon has not elapsed.
+    outcome: Mapped[str] = mapped_column(String(16), default="pending")
+    pnl_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    benchmark_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")
+    reflection: Mapped[str] = mapped_column(Text, default="")
+
+    __table_args__ = (
+        Index("ix_ai_decision_log_applied", "applied_at"),
+        UniqueConstraint("recommendation_id", name="uq_ai_decision_log_rec"),
+    )
+
+
 class Meta(Base):
     __tablename__ = "meta"
 

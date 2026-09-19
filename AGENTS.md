@@ -19,6 +19,8 @@ algobot start --demo-data      # offline demo, no network
 algobot stop                   # stop cleanly
 algobot status                 # show mode, strategy, positions
 algobot logs                   # recent logs (algobot logs 200 for more)
+algobot download --symbols BTC/USDT --intervals 1h --days 365   # deeper history
+algobot export --dir data/exports                                # trades/summary files
 ```
 
 **Foreground run (for debugging):**
@@ -30,21 +32,25 @@ algobot logs                   # recent logs (algobot logs 200 for more)
 
 **Test:**
 ```bash
-.venv/bin/python -m pytest tests/ -q                # 256 tests
+.venv/bin/python -m pytest tests/ -q                # 547 tests
 bash scripts/check_project_map.sh                   # verify docs in sync
 .venv/bin/python -m compileall -q algotrading       # byte‑compile check
 ```
 
 ## Conventions
 
-- **Configuration:** `config/settings.yaml` (YAML) for non‑secret settings; `.env` (gitignored) for secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS, BINANCE_*, AI_*, API_TOKEN).
+- **Configuration:** `config/settings.yaml` (YAML) for non‑secret settings; `.env` (gitignored) for secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS, BINANCE_*, BINANCE_TESTNET_*, AI_*, API_TOKEN, ALERT_WEBHOOK_URL).
+- **Risk is enforced, not documented.** `max_position_pct` caps every entry (`RiskManager.size_by_pct`), `max_daily_loss_pct` blocks new entries for the rest of the UTC day (`enforce_daily_loss` turns it off explicitly), and sizing uses the configured balance or the venue's. A guard that only exists in `config.py` validation is a bug.
+- **Evaluation interval:** `market.eval_interval` selects the interval the strategy engine evaluates; unset means the legacy "1h if present" rule. The stale-data allowance follows that interval's own length (`INTERVAL_MS`).
+- **Venues/orders:** spot Binance; `market.use_testnet` + `BINANCE_TESTNET_*` for testnet (validation requires keys for the *selected* venue). Entries are market by default; a signal may ask for a limit (`risk['order_type']='limit'`). `risk.exchange_stop_enabled` rests a stop on the exchange after a fill — its identity lives in `order_events` (`stop_placed`/`stop_canceled`), never a new column.
+- **Research:** `algotrading/backtest/` (slippage, configurable fees, optional risk-check simulation, metrics/walk-forward/Monte Carlo) and `algotrading/optimize/` (parameter search). The search MUST run as a separate niced process (`optimize/spawn.py`) and its only output is a PENDING `param_change`.
 - **Strategies:** Python files in `strategies/`; each defines `evaluate(symbol, candles)` and a `STRATEGY` alias. Hot‑reloaded every 300s. `strategies/three_commas_bot.py` is a worked hand-conversion of a Pine v5 script (long-only, signal-driven stops).
 - **Authoring contract (AI or hand-written):** the class must be buildable as `cls(params_dict)` (`def __init__(self, params=None)`), and only the indicator helpers / `math` / `statistics` may be imported (`from algotrading.strategy import indicators as ta`); anything else is refused by `strategy/validation.py`. `create_pending_recommendation` runs the full compile gate, so bad code comes back to the model as tool feedback instead of becoming an unapplicable Approve.
 - **Modules:** Plug‑in capabilities (market, execution, strategy, analytics, control, api) selected via `modules.enabled` in settings.yaml. Locked capabilities (execution) cannot be overridden.
 - **Event sourcing:** Orders write `trade_intent` before exchange call; fills append to immutable `order_events`; positions/trades rebuilt from events on start.
-- **AI assistant:** Advisory only. Can `propose_change` (parameter tweak, new strategy, etc.) but never executes. Enable with `AI_API_KEY` (external LLM) **or** `USE_HERMES=true` (local Hermes Agent CLI, no key).
+- **AI assistant:** Advisory only. Can `propose_change` (parameter tweak, new strategy, etc.) but never executes. Enable with `AI_API_KEY` (external LLM) **or** `USE_HERMES=true` (local Hermes Agent CLI, no key). News headlines, the decision log and the portfolio/correlation view are advisory context too — headline text is untrusted data (chat hard rule 5) and none of it feeds execution automatically.
 - **Naming:** Strategy files snake_case (e.g., `ema_crossover.py`). Module names in settings.yaml use dots (e.g., `market.binance`).
-- **Commits:** Keep `PROJECT_MAP.md` updated; `scripts/check_project_map.sh` fails if new source files undocumented.
+- **Commits:** Keep `PROJECT_MAP.md` updated; `scripts/check_project_map.sh` fails if new source files undocumented. Uncommitted work is fine; don't commit unless asked.
 
 ## Pitfalls
 
@@ -59,4 +65,9 @@ bash scripts/check_project_map.sh                   # verify docs in sync
 - **Ensembles:** `EnsembleStrategy` components resolve through `strategy/registry.build_strategy`, so AI-authored plugins qualify — but a component must be approved before an ensemble can reference it. `consensus` = "no firing component disagrees" and `filter` uses the first firing component as primary; don't document them as strict AND gates.
 - **Termux specifics:** `algobot` command installed to `$PREFIX/bin` by setup script; relies on `.venv` path. If moving repo, reinstall or run via `.venv/bin/python -m algotrading.main`.
 - **Trade safety:** Bot persists intent before order; retry uses same idempotency key. Never sends duplicate order.
-- **Live trading:** Requires `mode: live` in settings.yaml AND Binance keys; bot refuses to start otherwise.
+- **Live trading:** Requires `mode: live` in settings.yaml AND Binance keys; bot refuses to start otherwise. On testnet (`market.use_testnet: true`) the *testnet* keys are the ones required — the check follows the selected venue.
+- **Risk guard silence:** a "daily loss limit reached" skip is correct behaviour, not a bug — new entries stop for the rest of the UTC day while protective exits keep running. Look at the dashboard/daily-loss line before assuming the strategy is dead.
+- **Alerts:** the webhook channel is best-effort and rate-limited per kind; it never raises into the tick. `ALERT_WEBHOOK_URL` enables it (or the `alerts:` block). Silent alerts usually mean `notify_*` is off or the rate limit swallowed the event.
+- **Advisory memory lag:** the decision log is synced by the daily jobs (not at approval time), so a freshly applied recommendation may take until the next daily run to appear with its outcome.
+- **Dashboard/export auth:** `/dashboard` and `/export/*` need `Authorization: Bearer $API_TOKEN`; `/health` and `/metrics` stay open. `/dashboard` 404s when `api.dashboard: false`.
+- **Optimizer lock:** only one search may run (`optimize.results_dir` lockfile); a stale lock from a killed process is replaced automatically. Never run a search in-process — it contends with the 60s tick for the same interpreter.

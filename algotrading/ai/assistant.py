@@ -16,6 +16,8 @@ import logging
 from typing import Any, Sequence
 
 from algotrading.ai.client import AIClient, RecommendationError, extract_json
+from algotrading.ai.decision_log import build_lessons
+from algotrading.ai.news import fetch_headlines
 from algotrading.ai.prompt_builder import build_prompt
 from algotrading.db.models import AIRecommendation
 from algotrading.market.base import Candle
@@ -167,6 +169,28 @@ class Assistant:
             "rationale": data.get("rationale", "") or "",
         }
 
+    def _lessons(self) -> list[str]:
+        """Advisory memory: what past decisions did, from the decision log.
+
+        Deterministic text built from stored rows (no LLM call). Disabled or
+        failing means "no lessons", never a failed proposal.
+        """
+        ai = getattr(self._settings, "ai", None) if self._settings is not None else None
+        if ai is None or not getattr(ai, "decision_log_enabled", False):
+            return []
+        try:
+            return build_lessons(self._session, int(getattr(ai, "decision_log_lessons", 5) or 5))
+        except Exception:  # noqa: BLE001 - memory is an enhancement, not a dependency
+            log.warning("could not build decision-log lessons", exc_info=True)
+            return []
+
+    def _headlines(self) -> list[Any]:
+        """Public RSS headlines, only when ``ai.news_enabled``; else empty."""
+        ai = getattr(self._settings, "ai", None) if self._settings is not None else None
+        if ai is None or not getattr(ai, "news_enabled", False):
+            return []
+        return fetch_headlines(ai)
+
     def propose(
         self,
         symbol: str,
@@ -174,18 +198,31 @@ class Assistant:
         summaries: Sequence[Any],
         candles: Sequence[Candle],
         max_feature_rows: int = 24,
+        lessons: Sequence[str] | None = None,
+        headlines: Sequence[Any] | None = None,
     ) -> AIRecommendation | None:
         """Build the prompt, call the LLM, persist a PENDING recommendation.
 
         Returns the saved recommendation, or None if the LLM is disabled or
         fails (non-fatal — execution continues on the last approved strategy).
+
+        ``lessons``/``headlines`` default to the configured decision-log
+        lessons and (only when ``ai.news_enabled``) the public RSS headlines.
+        Both are DATA rendered into the prompt: neither can change the advisory
+        contract, and neither is ever consulted by the execution path.
         """
         if not self._client.enabled:
             log.info("AI disabled; skipping proposal")
             return None
 
+        if lessons is None:
+            lessons = self._lessons()
+        if headlines is None:
+            headlines = self._headlines()
+
         messages = build_prompt(
-            symbol, interval, summaries, candles, self._strategy_name, self._params, max_feature_rows=max_feature_rows
+            symbol, interval, summaries, candles, self._strategy_name, self._params,
+            max_feature_rows=max_feature_rows, lessons=lessons, headlines=headlines,
         )
         try:
             data = self._client.complete_json(messages)

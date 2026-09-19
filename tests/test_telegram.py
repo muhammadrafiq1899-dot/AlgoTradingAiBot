@@ -17,6 +17,7 @@ from sqlalchemy import select
 from telegram import Chat, Message, PhotoSize, Update, User
 from telegram.ext import MessageHandler
 
+from algotrading.ai.news import Headline
 from algotrading.backtest.runner import BacktestResult
 from algotrading.config import RiskConfig
 from algotrading.db import init_db, get_session_factory
@@ -992,3 +993,174 @@ def test_collect_image_accepts_a_document_and_prunes_stale_uploads(tmp_path):
     assert path.suffix == ".webp" and path.exists()
     assert context.bot.requested == ["doc-9"]
     assert not stale.exists(), "a crash-leftover upload must be swept up"
+
+
+# --- /portfolio + /news (P3 read-only surfaces) -------------------------------
+
+
+def _handlers_with_settings(session_factory, settings, allowed=(1,), **kwargs):
+    return {
+        next(iter(h.commands)): h
+        for h in build_handlers(
+            session_factory=session_factory,
+            settings=settings,
+            risk_cfg=RiskConfig(),
+            allowed_users=allowed,
+            **kwargs,
+        )
+        if hasattr(h, "commands")
+    }
+
+
+def test_portfolio_command_replies_to_allowed_user(session_factory):
+    handlers = _handlers(session_factory, allowed=(1,))
+    update = FakeUpdate(user_id=1)
+    asyncio.run(_run(handlers["portfolio"], update))
+
+    sent = update.effective_message._sent
+    assert sent, "allowed user should get the portfolio view"
+    assert "Portfolio" in sent[0][0]
+    assert "BTC/USDT" in sent[0][0]          # the seeded open position
+    assert sent[0][1] == "HTML"
+
+
+def test_portfolio_command_ignores_outsider(session_factory):
+    handlers = _handlers(session_factory, allowed=(1,))
+    update = FakeUpdate(user_id=999)
+    asyncio.run(_run(handlers["portfolio"], update))
+    assert not update.effective_message._sent
+
+
+def test_portfolio_command_survives_a_broken_view(session_factory, monkeypatch):
+    def boom(_session, _settings):
+        raise RuntimeError("portfolio exploded")
+
+    monkeypatch.setattr(commands_module, "portfolio_snapshot", boom)
+    handlers = _handlers(session_factory, allowed=(1,))
+    update = FakeUpdate(user_id=1)
+    asyncio.run(_run(handlers["portfolio"], update))
+
+    assert "Could not build the portfolio view" in update.effective_message._sent[0][0]
+
+
+def test_news_command_says_the_feature_is_off(session_factory, tmp_path):
+    handlers = _handlers_with_settings(
+        session_factory,
+        _ai_settings(tmp_path / "uploads", news_enabled=False),
+        allowed=(1,),
+    )
+    update = FakeUpdate(user_id=1)
+    asyncio.run(_run(handlers["news"], update))
+
+    text = update.effective_message._sent[0][0]
+    assert "news_enabled" in text and "off" in text
+
+
+def test_news_command_lists_headlines_when_enabled(session_factory, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        commands_module, "fetch_headlines",
+        lambda _ai: [Headline(title="<b>Fed</b> holds rates", url="https://e.test/1",
+                              source="e.test")],
+    )
+    handlers = _handlers_with_settings(
+        session_factory,
+        _ai_settings(tmp_path / "uploads", news_enabled=True,
+                     news_feed_urls=["https://e.test/rss"]),
+        allowed=(1,),
+    )
+    update = FakeUpdate(user_id=1)
+    asyncio.run(_run(handlers["news"], update))
+
+    text, parse_mode = update.effective_message._sent[0]
+    assert "News headlines" in text
+    assert "&lt;b&gt;Fed&lt;/b&gt; holds rates" in text      # headline text escaped
+    assert "untrusted third-party data" in text
+    assert parse_mode == "HTML"
+
+
+def test_news_command_handles_a_fetch_failure(session_factory, tmp_path, monkeypatch):
+    def boom(_ai):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(commands_module, "fetch_headlines", boom)
+    handlers = _handlers_with_settings(
+        session_factory,
+        _ai_settings(tmp_path / "uploads", news_enabled=True),
+        allowed=(1,),
+    )
+    update = FakeUpdate(user_id=1)
+    asyncio.run(_run(handlers["news"], update))
+
+    assert "No headlines available" in update.effective_message._sent[0][0]
+
+
+def test_news_command_ignores_outsider(session_factory, tmp_path):
+    handlers = _handlers_with_settings(
+        session_factory, _ai_settings(tmp_path / "uploads", news_enabled=True), allowed=(1,)
+    )
+    update = FakeUpdate(user_id=999)
+    asyncio.run(_run(handlers["news"], update))
+    assert not update.effective_message._sent
+
+
+def test_help_lists_the_new_commands(session_factory):
+    handlers = _handlers(session_factory, allowed=(1,))
+    update = FakeUpdate(user_id=1)
+    asyncio.run(_run(handlers["help"], update))
+
+    text = update.effective_message._sent[0][0]
+    assert "/portfolio" in text
+    assert "/news" in text
+    assert "/export" in text
+
+
+# --- /export (P2 read-only surface) ------------------------------------------
+
+
+def _export_settings(data_dir):
+    return type("S", (), {"mode": "paper", "data_dir": str(data_dir)})()
+
+
+def test_export_command_writes_files_and_reports_their_paths(session_factory, tmp_path):
+    settings = _export_settings(tmp_path / "data")
+    handlers = _handlers_with_settings(session_factory, settings, allowed=(1,))
+    update = FakeUpdate(user_id=1)
+
+    asyncio.run(_run(handlers["export"], update))
+
+    sent = update.effective_message._sent
+    assert sent, "allowed user should get the export report"
+    assert "Exported" in sent[0][0]
+    assert sent[0][1] == "HTML"
+
+    files = sorted((tmp_path / "data" / "exports").iterdir())
+    assert len(files) == 2, files
+    assert {f.suffix for f in files} == {".csv", ".json"}
+    # The message announces the real paths, so a phone user can act on them.
+    for f in files:
+        assert str(f) in sent[0][0]
+
+
+def test_export_command_ignores_outsider(session_factory, tmp_path):
+    settings = _export_settings(tmp_path / "data")
+    handlers = _handlers_with_settings(session_factory, settings, allowed=(1,))
+    update = FakeUpdate(user_id=999)
+
+    asyncio.run(_run(handlers["export"], update))
+
+    assert not update.effective_message._sent
+    assert not (tmp_path / "data").exists()
+
+
+def test_export_command_survives_a_write_failure(session_factory, tmp_path, monkeypatch):
+    def boom(_session, _path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(commands_module, "export_trades_csv", boom)
+    settings = _export_settings(tmp_path / "data")
+    handlers = _handlers_with_settings(session_factory, settings, allowed=(1,))
+    update = FakeUpdate(user_id=1)
+
+    asyncio.run(_run(handlers["export"], update))
+
+    assert "Export failed" in update.effective_message._sent[0][0]

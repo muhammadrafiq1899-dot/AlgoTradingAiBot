@@ -39,12 +39,35 @@ controlled from Telegram. Modular monolith, one Python process, one asyncio even
   terminal-free toolset so it cannot act on the machine. The Hermes provider can
   also **read images** (a Telegram photo/screenshot attached with `--image`); the
   API-key provider cannot, and says so instead of ignoring the picture.
+- **Venue:** Binance spot, with an explicit **testnet** mode (`market.use_testnet`,
+  keys `BINANCE_TESTNET_API_KEY/SECRET`) and an optional `market.base_url` override.
+  Orders are market by default; a signal may request a limit entry, and
+  `risk.exchange_stop_enabled` rests a **protective stop on the exchange** so a
+  position is still protected when the phone kills the bot process.
+- **Risk is enforced on the order path**, not just validated: `max_position_pct`
+  caps every entry, `max_daily_loss_pct` blocks new entries for the rest of the
+  UTC day (protective exits still run), and sizing uses the configured balance
+  (or the venue's, when it can report one). `market.eval_interval` selects the
+  interval the strategy engine evaluates.
+- **Research:** the backtest models slippage, configurable fees and (optionally)
+  the live risk checks, with Sharpe/Sortino/expectancy/profit-factor, day-week-month
+  breakdowns, walk-forward folds and seeded Monte Carlo/bootstrap; a parameter
+  search runs **out-of-process** (`algotrading/optimize/`) and can only ever file a
+  PENDING `param_change` proposal for human approval.
+- **Surfaces beyond Telegram:** a read-only HTML dashboard (`/dashboard`), CSV/JSON
+  export (`/export/*`, `algobot export`), a webhook alert channel
+  (`ALERT_WEBHOOK_URL`), deeper data downloads (`algobot download`) and public-RSS
+  news for the advisory context (`ai.news_enabled`).
+- **Advisory memory:** `ai/decision_log.py` records what was approved and how it
+  performed, and feeds those lessons back into the daily `ai_review` prompt. The
+  portfolio view (`/portfolio`) shows exposure and a *descriptive* correlation
+  matrix — context, never a signal.
 - **Modes:** `paper` (simulated fills vs live prices, no keys) / `live` (real orders, requires keys).
 - **Data:** SQLite (WAL), event-sourced trade lifecycle (`order_events` is the source of truth).
 - **Stack constraints (Termux/Android):** no ccxt (pulls Rust `cryptography`), no `openai` SDK
   (pulls Rust `jiter`), pydantic **v1** only, pure-Python indicators (no numpy/pandas).
 - Version: `algotrading/__init__.py` → `__version__ = "0.1.0"`.
-- Tests: `pytest tests/` (256 passing, all M0–M7 milestones; includes a full non-technical-user scenario in `tests/test_scenario_end_to_end.py`).
+- Tests: `pytest tests/` (547 passing, all M0–M7 milestones; includes a full non-technical-user scenario in `tests/test_scenario_end_to_end.py`).
 
 ## 2. How to run
 
@@ -55,6 +78,15 @@ bash scripts/setup_termux.sh            # one-time: pkgs, venv, deps, .env, DB i
 .venv/bin/python -m algotrading.main --no-telegram # headless
 bash scripts/run_bot.sh                 # supervised loop: auto-restart + sleep-aware heartbeat watchdog
 .venv/bin/python -m pytest tests/ -q    # test suite
+```
+
+Research/ops helpers (all optional, none needed to trade):
+
+```bash
+algobot download --symbols BTC/USDT --intervals 1h --days 365 [--export data/candles.csv]
+algobot export --dir data/exports       # trades.csv, trades.json, equity.csv, summary.json
+.venv/bin/python scripts/optimize.py --strategy ema_crossover --interval 1h --propose
+curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:8000/dashboard   # read-only
 ```
 
 ⚠️ **Gotcha:** `python -m algotrading.main` must run from the repo root (or any dir — `main.py`
@@ -85,28 +117,32 @@ AlgoTrading/
 │   ├── cli_setup.py          # .env read/write, setup wizard, algobot start/stop/status/logs
 │   ├── modules/              # plug-and-play module framework (base/registry/manager)
 │   │   └── builtin/          # shipped modules: market, gateway, strategy, analytics, telegram, api
-│   ├── market/               # price data: providers + candle store
+│   ├── market/               # price data: providers + candle store + downloads
 │   ├── strategy/             # pure strategies, indicators, signal evaluation engine
 │   │                         #   + validation.py (code safety) + plugins.py (strategy files)
 │   ├── execution/            # risk checks, trade intents, order gateways (paper/live)
 │   ├── ledger/               # event-sourced trade lifecycle (fills → positions/trades)
-│   ├── db/                   # SQLAlchemy models, engine/session, seeding
-│   ├── analytics/            # metrics from closed trades + periodic summaries
-│   ├── ai/                   # advisory LLM: client, prompt builder, assistant
+│   ├── db/                   # SQLAlchemy models, engine/session, seeding, migrations
+│   ├── analytics/            # metrics from closed trades + periodic summaries + portfolio
+│   ├── ai/                   # advisory LLM, prompt builder, assistant, news, decision log
 │   ├── hermes_ai/            # advisory LLM via the local Hermes Agent CLI (USE_HERMES)
-│   ├── store/                # recommendation lifecycle + versioned strategy release
+│   ├── alerts/               # outbound webhook alert channel (best-effort, rate limited)
+│   ├── store/                # recommendation lifecycle + versioned release + exports
 │   ├── telegram/             # control surface: bot bootstrap, commands, UI formatting
-│   ├── api/                  # optional FastAPI: /health (open), /status (bearer)
+│   ├── api/                  # optional FastAPI: /health, /status, /dashboard, /export/*
 │   ├── scheduler/            # APScheduler job registry (the heartbeat of the bot)
 │   ├── supervisor/           # Termux wake-lock, heartbeat file, order reconciliation
-│   └── backtest/             # shadow backtest for AI proposals
+│   ├── backtest/             # replay + metrics/walk-forward/Monte Carlo for AI proposals
+│   └── optimize/             # out-of-process parameter search → PENDING proposal
 ├── .github/workflows/       # CI (ci.yml): pytest + PROJECT_MAP freshness check
 ├── scripts/                  # setup_termux.sh, run_bot.sh, init_db.py, setup.py, algobot,
-│                             #   check_project_map.sh (map freshness), install_hooks.sh
+│                             #   check_project_map.sh, install_hooks.sh,
+│                             #   download_data.py, export_data.py, optimize.py
 ├── config/                   # settings.yaml (everything tunable), strategies.yaml (schemas)
 ├── strategies/               # user/AI-authored strategy plugins (.py), hot-reloaded
 ├── tests/                    # pytest suite, one file per subsystem
-├── data/                     # runtime: algotrading.db, heartbeat, algobot.pid (gitignored)
+├── data/                     # runtime: algotrading.db, heartbeat, algobot.pid, exports/,
+│                             #   optimize/ (all gitignored)
 └── logs/                     # algotrading.log (rotating, gitignored)
 ```
 
@@ -134,13 +170,23 @@ scheduler.market_tick (algotrading/scheduler/jobs.py)
   → CandleStore.upsert (incremental: skips rows older than the stored latest, one
     batched INSERT ... ON CONFLICT DO UPDATE) → DB table `candles`
   → protective exits first: execution.update_trailing_stops (+ execute the sell signals)
-  → stale-data freeze check (max_staleness_seconds)
+  → stale-data freeze check: stale_data(settings, newest_ts, eval_interval)
+    (allowance = the eval interval's own length + max_staleness_seconds)
   → strategy.StrategyEngine.evaluate(snapshot)   → DB table `signals` (candidate|skipped)
   → execution.ExecutionEngine.execute(signal_id)
       → risk.RiskManager.check_buy/check_sell   (reject → `risk_skipped` event)
+          · check_buy also blocks on the daily-loss guard (daily_pnl vs
+            risk.max_daily_loss_pct); sells are NEVER blocked by it
+      → sizing: RiskManager.size_by_pct(balance, price, position_pct) — clamped
+        to risk.max_position_pct; balance = gateway.get_balance() or the configured
+        paper balance (never a hardcoded constant)
       → persist TradeIntent (UNIQUE idempotency_key) BEFORE order  ← safety rule #1
-      → gateway.place_market_order (PaperGateway | LiveGateway)
+      → gateway.place_market_order | place_limit_order (PaperGateway | LiveGateway)
       → ledger.Ledger.mark_filled/mark_sent/mark_failed  → immutable `order_events`
+      → on a buy fill with risk.exchange_stop_enabled: gateway.place_stop_order rests
+        a protective stop on the venue, recorded as a `stop_placed` event (and
+        `stop_canceled` when it moves or the position closes)
+      → best-effort alerts (algotrading/alerts): `fill`, `risk`, `error` kinds
       → positions/trades derived views updated incrementally
 ```
 
@@ -149,10 +195,14 @@ scheduler.market_tick (algotrading/scheduler/jobs.py)
 of `data/heartbeat`). **Module-contributed jobs** (from `Module.jobs(ctx)`):
 `analytics` (30m metrics snapshot), `analytics_daily` (UTC midnight), `ai_review`
 (daily advisory LLM proposal → PENDING recommendation) from the analytics module,
-and `strategy_plugins_reload` from the strategy module.
+and `strategy_plugins_reload` from the strategy module. The advisory decision log
+runs *inside* the two daily jobs (no extra job id): `decision_log_tick(ctx)` syncs
+newly applied recommendations and evaluates the ones whose horizon elapsed, so
+`ai_review` carries current lessons.
 
 **Control surfaces (do NOT drive the pipeline):** Telegram commands (`/status`,
-`/strategy`, `/risk`, `/summary`, `/start_bot`, `/stop_bot`, inline ✅/❌ approval),
+`/strategy`, `/risk`, `/summary`, `/portfolio`, `/news`, `/export`, `/start_bot`,
+`/stop_bot`, inline ✅/❌ approval),
 plain-text **chat** (`telegram/chat.py`: the LLM orchestrator answers questions and
 can call `get_status` / `get_market` / `backtest` / `propose_change` tools),
 **image chat** (Telegram photos are buffered per chat for `PHOTO_BATCH_DELAY_SECONDS`;
@@ -237,8 +287,42 @@ Telegram bot runs in the event loop with one session.
 | `scripts/run_bot.sh` | Supervisor loop: restart + heartbeat watchdog (300s grace period before it can kill, extended by however long this loop itself was suspended — a screen-off phone must not look like a hung bot; single-instance lock via `data/run_bot.lock`); auto SQLite backup before each start (`data/backups/`, 7-day retention) | — |
 | `scripts/init_db.py` | Create DB + seed (idempotent) | — |
 | `scripts/setup.py`, `scripts/algobot` | Thinnest wrappers over `cli_setup` | — |
-| `config/settings.yaml` | All tunables: mode, universe, risk, schedule, AI, API | — |
+| `config/settings.yaml` | All tunables: mode, universe, risk, backtest, optimize, alerts, analytics, schedule, AI, API | — |
 | `config/strategies.yaml` | Strategy param schemas (seeds DB, validates AI diffs) | — |
+
+### 5b. Modules added/changed in the P0–P3 hardening pass
+
+| Path | Purpose | Key symbols |
+|---|---|---|
+| `algotrading/alerts/webhook.py` | Outbound webhook alerts (best-effort, per-kind rate limit, never raises; enabled by `ALERT_WEBHOOK_URL` or `alerts.enabled`) | `WebhookAlerter.send/status/kind_enabled`, `Alert.to_payload`, `configure_alerter`, `get_alerter`, `notify`, `KIND_FLAGS` (`signal`/`fill`/`risk`/`error`) |
+| `algotrading/ai/news.py` | Public-RSS headlines as **untrusted** advisory context (TTL cache, size cap, failure ⇒ empty list) | `Headline`, `fetch_headlines`, `format_headlines`, `NEWS_UNTRUSTED_HEADER` |
+| `algotrading/ai/decision_log.py` | Advisory memory: what was approved and how it performed | `record_applied`, `sync_applied`, `evaluate_due`, `build_lessons`, `reflect` |
+| `algotrading/analytics/portfolio.py` | Exposure per symbol + **descriptive** Pearson correlation over stored closes (not a signal; skipped symbols are reported) | `portfolio_snapshot`, `format_portfolio` |
+| `algotrading/api/dashboard.py` | Read-only server-rendered HTML page (inline CSS, meta-refresh, `html.escape` on every value) | `collect_state`, `render_dashboard` |
+| `algotrading/api/app.py` | adds bearer-guarded `/dashboard` + `/export/trades.csv|.json|/summary.json`; `/health` stays open | `build_api` |
+| `algotrading/backtest/metrics.py` | Metrics beyond PnL/DD + walk-forward + seeded Monte Carlo/bootstrap | `compute_metrics`, `walk_forward`, `monte_carlo`, `bootstrap`, `BARS_PER_YEAR` |
+| `algotrading/backtest/runner.py` | Replay with slippage, configurable fees, optional risk-check simulation, intra-bar `stop_pct`/`take_profit_pct`, lazy `CandleWindow` (no per-bar copy) | `run_backtest`, `BacktestResult` (`assumptions`, equity curve, guard counters), `CandleWindow` |
+| `algotrading/market/download.py` | Resumable history downloads + on-disk candles for offline backtests | `download_history`, `export_candles`, `load_candles_file`, `CANDLE_HEADER`, `CandleFileError` |
+| `algotrading/market/candles.py` | `backfill` gains `since_ms`/`max_rows`/`progress`; `1M` steps 28 days so it can never skip a candle | `INTERVAL_MS`, `APPROXIMATE_INTERVALS`, `APPROXIMATE_STEP_MS`, `backfill` |
+| `algotrading/market/binance_rest.py` | testnet/base-url venue selection + limit/stop orders + balances | `resolve_venue`, `place_limit_order`, `place_stop_order`, `list_open_orders`, `get_balance` |
+| `algotrading/execution/base.py` | Gateway protocol: `place_market_order` mandatory, **optional** capabilities probed with `getattr` | `ExchangeGateway`, `OrderResult` |
+| `algotrading/execution/paper_gateway.py` | same optional surface simulated in memory (resting/filled limits, stop triggers, cancel, balance) | `PaperGateway` |
+| `algotrading/execution/engine.py` | exchange-side protective stop (identity kept in `order_events`, never a new column), optional limit entries, alerts | `_resting_stop`, `_record_stop_event`, `_daily_realized_pnl`, `_balance`, `_qty_for` |
+| `algotrading/execution/risk.py` | caps actually enforced on the order path | `clamp_position_pct`, `size_by_pct`, `daily_loss_breached`, `check_buy(..., daily_pnl=)` |
+| `algotrading/optimize/search.py` | grid/random candidate generation + ranking by the configured objective | `generate_grid`, `run_search`, `SearchResult`, `Candidate`, `aggregate_folds` |
+| `algotrading/optimize/runner.py` | the separate-process entry point (`python -m algotrading.optimize.runner`) | `main`, `run`, `EXIT_*` |
+| `algotrading/optimize/spawn.py` | spawns the search niced, with a wall-clock timeout and a lockfile (never in the scheduler thread) | `start_search_subprocess` |
+| `algotrading/optimize/proposal.py` | files the best candidate as a **PENDING** `param_change` (never applies it) | `propose_from_result` |
+| `algotrading/store/export.py` | CSV/JSON exporters over the DB (read-only, atomic) | `trade_rows`, `equity_rows`, `summary_dict`, `export_trades_csv/json`, `export_equity_csv`, `export_summary_json` |
+| `algotrading/db/models.py` | new `AIDecisionLog` table | `AIDecisionLog` |
+| `algotrading/db/__init__.py` | schema version 3 + additive migration for `ai_decision_log` | `SCHEMA_VERSION`, `_ensure_decision_log` |
+| `algotrading/scheduler/jobs.py` | testable staleness seam, decision-log tick, error alerts | `stale_data`, `decision_log_tick`, `market_tick`, `ai_review` |
+| `algotrading/telegram/commands.py` | new `/portfolio`, `/news`, `/export` commands (auth + rate limit as before) | `portfolio_cmd`, `news_cmd`, `export_cmd`, `build_handlers` |
+| `algotrading/telegram/ui.py` | formatters for the new surfaces | `format_portfolio`, `format_news` |
+| `algotrading/cli_setup.py` | new `algobot download` / `algobot export` subcommands | `start/stop/status/show_logs`, `download`, `export` |
+| `algotrading/ai/prompt_builder.py` | optional news + lessons blocks (both off by default) | `build_prompt`, `build_feature_window` |
+| `algotrading/modules/builtin/market_provider.py`, `execution_gateway.py` | pass venue selection (testnet/base_url) through; market data stays on the same venue as orders | `BinanceMarketModule`, `LiveGatewayModule`, `resolve_venue` |
+| `scripts/download_data.py`, `scripts/export_data.py`, `scripts/optimize.py` | thin CLIs for the new subsystems | — |
 
 ## 6. Database tables (SQLite, `data/algotrading.db`)
 
@@ -253,9 +337,12 @@ Telegram bot runs in the event loop with one session.
 | `candles` | OHLCV (PK: symbol+interval+ts) | source |
 | `analytics_summaries` | Periodic metric snapshots (30m/daily) | source |
 | `ai_recommendations` | AI proposals: `pending/approved/rejected/applied` + backtest_json | source |
+| `ai_decision_log` | Advisory memory: one row per applied recommendation (kind, applied_at, evaluated_at, horizon_days, outcome win/loss/flat, pnl_pct, benchmark_pct, metrics_json, reflection) | source |
 | `meta` | Key/value: `schema_version`, `strategies_seeded` | source |
 
-Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (bump + add migration in `init_db`).
+Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (currently **3**;
+version 3 added `ai_decision_log`; bump + add a migration in `init_db` for any new
+table/column — migrations must be additive so an existing DB is never wiped).
 
 ## 7. Feature map — "I want to…" → where to go
 
@@ -304,6 +391,21 @@ Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (bump + add mig
 | Convert a Pine Script strategy into the bot | `strategies/three_commas_bot.py` is a worked example: same loader/validator/approval path as any plugin (`strategies/README.md` has the contract — `cls(params_dict)`, `evaluate(symbol, candles)`, indicator/math imports only). Long-only spot: map Pine shorts to exits, and turn broker stop/limit orders into sell signals |
 | Verify the whole product as a user | `tests/test_scenario_end_to_end.py` — the end-to-end journey (setup → trade → every command → AI approval → API → restart) |
 | Ensemble/filter strategies | `strategy/starters.py` `EnsembleStrategy` + `config/strategies.yaml` `ensemble` + `store/recommendations.py` `ensemble_strategy`/`filter_strategy` kinds (consensus/any/filter/weighted modes) |
+| Change the risk caps / daily-loss guard | `execution/risk.py` (`clamp_position_pct`, `size_by_pct`, `daily_loss_breached`) + `config/settings.yaml` `risk:` — all of them are enforced on the buy path in `execution/engine.py`, not merely validated |
+| Trade a faster/slower timeframe | `config/settings.yaml` `market.eval_interval` (must be one of `market.intervals`); the stale-data allowance follows that interval's length (`scheduler/jobs.py` `stale_data`) |
+| Use Binance testnet | `market.use_testnet: true` + `BINANCE_TESTNET_API_KEY/SECRET`; `mode: live` is still required and validation follows the selected venue |
+| Enable an exchange-side protective stop | `risk.exchange_stop_enabled: true` (needs `trailing_stop_pct` or a signal-provided stop) → `execution/engine.py` `_resting_stop`; identity lives in `order_events` (`stop_placed`/`stop_canceled`) |
+| Send a limit entry instead of a market order | strategy signal `risk['order_type'] = 'limit'` + `risk['limit_offset_pct']`; an unfilled limit stays `sent` for the reconcile job |
+| Download more history / export candles to disk | `algobot download --symbols BTC/USDT --intervals 1h --days 365 [--export data/candles.csv]` → `market/download.py` |
+| Backtest from a file (no DB, no network) | `market/download.py` `load_candles_file(...)` → `backtest/runner.py` `run_backtest(...)` |
+| Add metrics / walk-forward / Monte Carlo to a backtest | `backtest/metrics.py` (`compute_metrics`, `walk_forward`, `monte_carlo`, `bootstrap`); budgets in `config/settings.yaml` `backtest:` |
+| Search parameters (out of process) | `.venv/bin/python scripts/optimize.py --strategy ema_crossover --symbol BTC/USDT --interval 1h [--propose]` → `optimize/spawn.py`; the result can only become a PENDING proposal (`optimize/proposal.py`) |
+| Review the decision history / lessons | `algotrading/ai/decision_log.py` + the `ai_decision_log` table; lessons are injected into the daily `ai_review` prompt |
+| See the portfolio / correlation view | Telegram `/portfolio` → `analytics/portfolio.py` (descriptive context, explicitly not a signal) |
+| Add news to the advisory context | `config/settings.yaml` `ai.news_enabled: true` (+ `ai.news_feed_urls`); Telegram `/news`; headlines are untrusted data (`ai/news.py`) |
+| Open a read-only web dashboard | `api.enabled: true` + `API_TOKEN`, then `/dashboard` (`api/dashboard.py`, gated by `api.dashboard`) |
+| Export trades from the API or the phone | bearer-guarded `/export/trades.csv`, `/export/trades.json`, `/export/summary.json` (`store/export.py`); Telegram `/export` writes the same files under `data/exports/` |
+| Get alerts on fills/risk/errors | `.env` `ALERT_WEBHOOK_URL` (or the `alerts:` block) → `algotrading/alerts/`; add a kind via `KIND_FLAGS` + a `notify_*` switch |
 
 ## 8. Debugging guide
 
@@ -349,6 +451,17 @@ with correlation IDs (request/trace tracking). JSON fields configurable via
 | "strategy cannot be built as cls(params_dict)" | the generated class used a keyword constructor (`def __init__(self, period=14)`) instead of taking the params dict | the propose-time gate rejects it before any approval; the prompt and `strategies/README.md` state the required shape |
 | "strategy plugin 'X' already exists" right after a failed approval | a half-written plugin file from an earlier failure (fixed: a failed write is now removed) | delete the stale `strategies/X.py` and re-approve |
 | strategy eval broken after release | version `retired/active` mismatch in `store/strategy_versions.py`; params JSON invalid → engine logs "Cannot build active strategy" |
+| "daily loss limit reached" skips every signal | `risk.max_daily_loss_pct` blocks new entries for the rest of the UTC day (protective exits still run). Check the dashboard/`/status` daily-loss line, or disable the guard deliberately with `risk.enforce_daily_loss: false` |
+| entries appear at the wrong timeframe | `market.eval_interval` is unset, so the legacy rule picked `1h`; set it explicitly |
+| alert webhook silent | `alerts.enabled` false or no URL, the kind switch (`notify_*`) is off, or the per-kind rate limit swallowed it — check `algotrading.alerts.get_alerter().status()` and the "alert suppressed (rate limit)" log line |
+| Telegram says "Export failed" | `/export` writes under `data/exports/`; check free space and `logs/algotrading.log` |
+| dashboard/export return 401 | `/dashboard` and `/export/*` are bearer-guarded (`Authorization: Bearer $API_TOKEN`); `/health` and `/metrics` stay open. `/dashboard` 404s entirely when `api.dashboard: false` |
+| optimizer says the lock is held | another search is running (`settings.optimize.results_dir`); a stale lock from a killed process is replaced automatically — see `optimize/spawn.py` |
+| optimizer ran but no proposal appeared | candidates below `optimize.min_trades` are rejected; only the best candidate is offered, and it lands as PENDING for ✅ approval |
+| walk-forward reports "consistent: false" | fewer than half the folds were profitable — a coarse majority screen, not a significance test; it proves nothing either way |
+| a paper stop never triggers | paper resting orders are only evaluated at placement, so a stop resting below the market stays resting until cancelled (documented in `paper_gateway.py`) |
+| testnet orders rejected / no history | testnet has thin liquidity and short history; it needs `market.use_testnet: true`, the testnet keys, and `mode: live` |
+| `/news` shows nothing | feed unreachable (offline) or `ai.news_enabled: false`; failures log a warning and return no headlines by design |
 | `No module named algotrading/main` | bot started from wrong directory (see §2) |
 | schema/migration issues | `SCHEMA_VERSION` + `meta` table; derived tables are rebuilt from `order_events`, never hand-edit |
 
@@ -379,6 +492,16 @@ deterministic fix.
 | `test_strategy_plugins.py` | plugin load/write/edit, code-safety rejection (including the import allowlist: documented form works, bare `indicators` is aliased, siblings/os are refused), constructor shape (`cls(params_dict)` probe), propose-time gate for uncompilable code, failed-write cleanup, hot-reload, AI authoring flow, ensemble components: an AI-authored plugin combines (and an unknown name still fails) |
 | `test_scenario_end_to_end.py` | **Full non-technical-user scenario**: setup wizard, module composition, a real entry + trailing-stop exit (regression: protective exits run with no candidates, NULL `highest_price`, `CandleStore.latest` never existed), every Telegram command + backtest button + approve/reject, chat-driven `new_strategy` approval, analytics, API, restart rebuild |
 | `test_three_commas_bot.py` | The Pine v5 "3Commas Bot" port in `strategies/three_commas_bot.py`: real-loader contract, catalog metadata/ranges, entry + MA-cross exit, ATR swing stop, R:R target, ATR trailing exit (and that it beats the static stop on a reversal), rr_exit arming, session (incl. wrap-around) and date filters, all nine MA types, and activation through an approved `param_change` |
+| `test_risk_guards.py` | P0 enforcement: `clamp_position_pct`/`size_by_pct` caps, the daily-loss guard (thresholds, disable switch, entry-only), entry size capped at `max_position_pct` and based on the configured balance, gateway balance used when reported, daily-loss skips recorded as `risk_skipped`, protective sells still allowed, `primary_interval()`/`stale_data()` interval arithmetic, and that every configured interval exists in `INTERVAL_MS` |
+| `test_order_types.py` | P2 venue/orders: paper limit fill vs resting, stop trigger + slippage, cancel, open orders, balance; live REST param shapes for LIMIT/STOP_LOSS/STOP_LOSS_LIMIT; testnet selection + "no mainnet fallback"; startup validation following the selected venue; the engine's resting stop (placed/cancelled/re-placed, never double-placed, survives a restart, a failed cancel never blocks the ledger) |
+| `test_backtest_metrics.py` | Metric maths against hand-computed values, undefined-metric handling, day/week/month/year breakdowns, JSON serialisability, walk-forward folds, and seeded-deterministic Monte Carlo/bootstrap |
+| `test_optimize.py` | Grid cap/duplicates/determinism, ranking, `min_trades` and timeout rejections, artifact round-trip, the child process writing a real artifact from stored candles, the PENDING-only proposal (no strategy version, active row untouched), and source-level checks that the optimizer imports no telegram/scheduler/execution |
+| `test_download.py` | Download pagination/resume/row cap, the `1M` no-skip proof, CSV/JSONL round-trips, atomic writes, malformed-file errors, and `run_backtest` consuming a loaded file |
+| `test_export.py` | CSV/JSON export shapes, ISO timestamps, equity-curve maths, empty-DB behaviour |
+| `test_alerts.py` | Webhook channel: disabled ⇒ no POST, structured JSON payload, per-kind rate limiting, kind switches, transport/5xx failures swallowed without counting as delivered, `configure_alerter` wiring |
+| `test_news.py` | RSS/Atom parsing without network, item cap, dedupe, size cap, TTL cache, failure ⇒ empty, untrusted-data header |
+| `test_decision_log.py` | Record/idempotency, horizon-elapsed evaluation, win/loss/flat outcomes from seeded trades, lesson text/limit, reflection, and the additive schema migration on an existing DB |
+| `test_portfolio.py` | Hand-computed Pearson value, zero-variance/short-history handling, exposure maths, formatter escaping/truncation and the "not a signal" caveat |
 
 ## 10. Keeping this map in sync (git hook / CI)
 
@@ -417,3 +540,7 @@ deterministic fix.
 7. **Thread-safety:** each job/thread opens its own DB session.
 8. **Termux compatibility:** keep deps dependency-light (no ccxt/openai-sdk/numpy/pandas; pydantic v1; pure-Python math).
 9. **Execution is locked:** the `execution` capability may only be provided by built-in modules, and `modules.disabled`/`modules.enabled` cannot remove or replace it. All AI/user-authored code (strategies, indicators) goes through `strategy/validation.py` before it can run, and can never mutate `ctx.gateway` or the ledger.
+10. **Risk caps are enforced, not documented:** `max_position_pct` caps every entry on the order path (`execution/engine.py` `_qty_for` → `RiskManager.size_by_pct`), `max_daily_loss_pct` blocks new entries once today's realized loss reaches it, and the sizing basis is the configured balance (or the venue's). A guard that only lives in `config.py` validation is a bug, not a feature — see `tests/test_risk_guards.py`.
+11. **Protection is layered, not replaced:** `risk.trailing_stop_pct` stays the in-process protective exit (it runs before the stale gate every tick); `risk.exchange_stop_enabled` adds a resting stop **on the venue** so protection survives the bot being killed. The resting stop's identity is read back from `order_events` (`stop_placed`/`stop_canceled`) — never from a new mutable column — and a failed cancel is logged + alerted but never blocks a ledger write.
+12. **Advisory surfaces never feed execution:** news headlines (`ai/news.py`), the decision log (`ai/decision_log.py`), the portfolio/correlation view (`analytics/portfolio.py`) and the parameter search (`optimize/`) are inputs to *proposals* and to the human's reading. Headline text is untrusted data (chat hard rule 5). The optimizer's only output is a PENDING recommendation — it never writes settings and never touches the active strategy.
+13. **Heavy work stays out of the runtime interpreter:** the 60s tick shares this process, so a parameter search is spawned as a separate niced OS process with its own timeout and lockfile (`optimize/spawn.py`). In-process training/search belongs in a trainer venv, never in a scheduler worker thread.
