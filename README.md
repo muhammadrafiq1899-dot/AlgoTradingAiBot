@@ -47,7 +47,13 @@ Version `0.1.0`.
   can pass), not "every component must agree".
 - **Truncated model answers** (the provider occasionally cuts a long reply
   mid-sentence) no longer lose the turn: the readable part is kept.
-- Test suite grew from 185 to 230 tests.
+- **New ready-to-use strategy: `three_commas_bot`** — the Pine v5 "3Commas Bot"
+  converted to a plugin: MA-pair crossover entry (nine MA types), ATR swing stop,
+  Reward:Risk target, ATR trailing exit with its `rr_exit` arming level, and the
+  session/date filters. Long-only and signal-driven (see the file's header for the
+  deliberate differences from the Pine original). Turn it on by approving a
+  parameter change, or ask the bot to backtest it against your other strategies.
+- Test suite grew from 185 to 256 tests.
 
 ---
 
@@ -612,8 +618,16 @@ retired). Files are inspectable, diffable, and hand-editable.
 ```
 strategies/
   momentum_nudge.py     # class with evaluate(symbol, candles) + STRATEGY alias
+  three_commas_bot.py   # worked example: a Pine v5 script converted by hand
   README.md             # the authoring guide
 ```
+
+`three_commas_bot.py` is worth reading if you want to port a Pine/TradingView
+strategy yourself: it shows the required class shape, how the metadata blocks
+(`STRATEGY_PARAMS`, `STRATEGY_INDICATORS`) feed `/strategies`, how a stop/target
+becomes a *signal* (the bot sends market orders, so levels are checked against the
+bar's high/low), and why a strategy must be stateless — the engine rebuilds it on
+every tick, so the file replays its own window to know where it stands.
 
 - On load, each file goes through `strategy/validation.py` — a single AST gate
   that whitelists imports/names and forbids `eval`, `exec`, `open`, dunder
@@ -805,7 +819,7 @@ chmod +x ~/.termux/services/algotrading/run
 ## 24. Testing
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 230 tests
+.venv/bin/python -m pytest tests/ -q          # 256 tests
 bash scripts/check_project_map.sh             # map freshness
 .venv/bin/python -m compileall -q algotrading # byte-compile check
 ```
@@ -827,6 +841,7 @@ bash scripts/check_project_map.sh             # map freshness
 | `test_ema_percentage_strategy.py` | EMA % strategy signals |
 | `test_modules.py` | Module resolution, external loading, lifecycle, execution lock |
 | `test_strategy_plugins.py` | Plugin load/write/edit, safety rejection, hot-reload, AI authoring, plugin strategies as ensemble components |
+| `test_three_commas_bot.py` | The Pine v5 "3Commas Bot" port: loader contract, entry/stop/target/trail exits, filters, all nine MA types, activation |
 | **`test_scenario_end_to_end.py`** | **The whole product as a non-technical trader would use it** — setup wizard, startup, a real entry + trailing-stop exit, every Telegram command, chat-driven strategy creation and approval, analytics, API, and restart recovery |
 
 ## 25. Non-negotiable invariants
