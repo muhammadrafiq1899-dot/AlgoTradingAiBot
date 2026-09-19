@@ -20,6 +20,8 @@ PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
 RUN_BOT = PROJECT_ROOT / "scripts" / "run_bot.sh"
 PID_PATH = PROJECT_ROOT / "data" / "algobot.pid"
 LOG_PATH = PROJECT_ROOT / "logs" / "algotrading.log"
+# How long `algobot stop` waits for a clean shutdown before SIGKILLing the group.
+STOP_GRACE_SECONDS = 20
 
 # Field order shown to the user during setup.
 ENV_FIELDS: list[dict] = [
@@ -260,14 +262,53 @@ def stop() -> None:
         print("Bot is not running.")
         return
     import signal
+    import time
     # The bot runs as a supervisor process group (start_new_session=True), so
     # the group leader's pid == its pgid. Signal the whole group to take down
     # both the supervisor loop and the bot child it spawns.
     try:
         os.killpg(pid, signal.SIGTERM)
-        print(f"Sent stop signal to bot (pid {pid}).")
     except OSError as exc:
         print(f"Could not signal pid {pid}: {exc}")
+        return
+    print(f"Sent stop signal to bot (pid {pid}).")
+
+    # The bot shuts down through scheduler.shutdown(wait=True), which waits for
+    # the in-flight tick — a slow exchange call can hold that for a while, and a
+    # tick that never returns leaves the python child alive after the supervisor
+    # is gone. Escalate, or the "stopped" bot keeps burning CPU in the
+    # background (and the next start then runs two bots on one database).
+    deadline = time.time() + STOP_GRACE_SECONDS
+    while time.time() < deadline:
+        if not _group_alive(pid):
+            print("Bot stopped.")
+            return
+        time.sleep(0.5)
+
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError as exc:
+        print(f"Could not kill pid {pid}: {exc}")
+        return
+    print(
+        f"Bot did not exit within {STOP_GRACE_SECONDS}s "
+        f"(a tick was still running) — killed (pid {pid})."
+    )
+
+
+def _group_alive(pgid: int) -> bool:
+    """True while any process is left in the supervisor's process group.
+
+    Checked with signal 0 on the *group*: the supervisor pid alone is not
+    enough, because it can die while its python child lives on.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def status() -> None:

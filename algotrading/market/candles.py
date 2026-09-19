@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from algotrading.db.models import Candle as CandleRow
@@ -30,32 +32,64 @@ class CandleStore:
         self._session = session
 
     def upsert(self, candles: list[Candle]) -> int:
-        """Insert candles, replacing any that already exist (by PK). Returns count."""
+        """Insert candles, replacing any that already exist (by PK).
+
+        Returns the number of rows actually written (not the input length).
+
+        Feeds hand back their whole recent window (up to 1000 candles) on every
+        tick, and all but the last one or two of those are already stored. Two
+        things keep this cheap — together they were costing ~10s per 1000 candles
+        and pinning a full CPU core inside the tick on a phone:
+
+        * Only rows at or after the newest stored candle for that symbol+interval
+          are written. Older candles are immutable history; rewriting them every
+          minute is pure DB/WAL churn. The newest incoming candle is still
+          refreshed, because the still-forming candle changes every tick.
+        * The write is a single batched ``INSERT ... ON CONFLICT DO UPDATE``
+          instead of one DELETE per row. The old loop called
+          ``session.execute(delete(...))`` once per row, and SQLAlchemy's default
+          autoflush flushed every object added so far on each of those calls —
+          making a 1000-row batch O(n^2).
+        """
         if not candles:
             return 0
-        rows = [
-            CandleRow(
-                symbol=c.symbol,
-                interval=c.interval,
-                ts=c.ts,
-                open=c.open,
-                high=c.high,
-                low=c.low,
-                close=c.close,
-                volume=c.volume,
+
+        latest_stored: dict[tuple[str, str], int | None] = {}
+        rows: list[dict[str, Any]] = []
+        for c in candles:
+            key = (c.symbol, c.interval)
+            if key not in latest_stored:
+                latest_stored[key] = self.latest_ts(c.symbol, c.interval)
+            stored = latest_stored[key]
+            if stored is not None and c.ts < stored:
+                continue  # immutable history we already have
+            rows.append(
+                {
+                    "symbol": c.symbol,
+                    "interval": c.interval,
+                    "ts": c.ts,
+                    "open": c.open,
+                    "high": c.high,
+                    "low": c.low,
+                    "close": c.close,
+                    "volume": c.volume,
+                }
             )
-            for c in candles
-        ]
-        # Upsert: delete-then-insert within a transaction for simplicity/correctness.
-        for r in rows:
-            self._session.execute(
-                delete(CandleRow).where(
-                    CandleRow.symbol == r.symbol,
-                    CandleRow.interval == r.interval,
-                    CandleRow.ts == r.ts,
-                )
-            )
-            self._session.add(r)
+        if not rows:
+            return 0
+
+        stmt = sqlite_insert(CandleRow)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["symbol", "interval", "ts"],
+            set_={
+                "open": stmt.excluded.open,
+                "high": stmt.excluded.high,
+                "low": stmt.excluded.low,
+                "close": stmt.excluded.close,
+                "volume": stmt.excluded.volume,
+            },
+        )
+        self._session.execute(stmt, rows)
         self._session.commit()
         return len(rows)
 

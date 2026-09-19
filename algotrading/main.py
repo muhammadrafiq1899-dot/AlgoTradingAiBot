@@ -188,8 +188,10 @@ def main(argv: list[str] | None = None) -> None:
         json_fields=settings.log_json_fields,
     )
 
-    if not args.demo_data:
-        ensure_wake_lock()
+    # Keep the CPU awake even in demo mode. This is a phone-first bot: without
+    # the wake lock Android can freeze or kill the whole app as soon as the
+    # screen goes off, and an unattended demo run is exactly that case.
+    ensure_wake_lock()
 
     try:
         asyncio.run(run(settings, demo=args.demo_data, no_telegram=args.no_telegram))

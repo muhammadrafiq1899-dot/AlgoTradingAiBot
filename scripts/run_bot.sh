@@ -7,6 +7,12 @@
 # data/heartbeat every 60s; if this loop finds the process alive but the
 # heartbeat stale, it kills and restarts it. Restart delay backs off when
 # runs are short (crash loop) and resets after a healthy run.
+#
+# Device sleep: on a phone the whole app (and this loop with it) can be frozen
+# or killed while the screen is off, so a stale heartbeat alone proves nothing.
+# This loop therefore measures its own drift: if a 10s sleep actually took much
+# longer, the device was suspended, not the bot hung — the grace period grows by
+# the lost time instead of a healthy bot being killed for it.
 set -u
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -68,17 +74,30 @@ while true; do
     # heartbeat goes stale while the process is still alive.
     # Grace period: never kill before MAX_STALE_SECONDS of uptime — a slow
     # boot (e.g. wake-lock or network stall) must not be killed before it
-    # writes its first heartbeat.
+    # writes its first heartbeat. GRACE_EXTRA grows by however long Android
+    # suspended this loop (screen off), so a sleeping phone is not mistaken
+    # for a hung bot; it resets as soon as the bot beats normally again.
+    GRACE_EXTRA=0
     while kill -0 "$BOT_PID" 2>/dev/null; do
         UPTIME=$(( $(date +%s) - START ))
-        if [ -f "$HEARTBEAT" ] && [ "$UPTIME" -gt "$MAX_STALE_SECONDS" ]; then
+        LIMIT=$(( MAX_STALE_SECONDS + GRACE_EXTRA ))
+        if [ -f "$HEARTBEAT" ] && [ "$UPTIME" -gt "$LIMIT" ]; then
             AGE=$(( $(date +%s) - $(stat -c %Y "$HEARTBEAT") ))
-            if [ "$AGE" -gt "$MAX_STALE_SECONDS" ]; then
-                echo "[$(date -u +%H:%M:%S)] heartbeat stale (${AGE}s) — killing bot" >&2
+            if [ "$AGE" -gt "$LIMIT" ]; then
+                echo "[$(date -u +%H:%M:%S)] heartbeat stale (${AGE}s, grace ${GRACE_EXTRA}s) — killing bot" >&2
                 kill "$BOT_PID" 2>/dev/null
+            else
+                GRACE_EXTRA=0
             fi
         fi
+        LOOP_START=$(date +%s)
         sleep 10
+        NOW=$(date +%s)
+        DRIFT=$(( NOW - LOOP_START - 10 ))
+        if [ "$DRIFT" -gt 30 ]; then
+            GRACE_EXTRA=$(( GRACE_EXTRA + DRIFT ))
+            echo "[$(date -u +%H:%M:%S)] this loop lost ${DRIFT}s (device asleep) — heartbeat grace now ${GRACE_EXTRA}s"
+        fi
     done
 
     wait "$BOT_PID" 2>/dev/null

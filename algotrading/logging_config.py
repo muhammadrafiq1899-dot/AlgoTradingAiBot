@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -30,6 +31,18 @@ from logging.handlers import RotatingFileHandler
 _correlation_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "correlation_id", default=""
 )
+
+
+def _stdout_is(path: Path) -> bool:
+    """True when stdout is already redirected to `path`.
+
+    `algobot start` appends the supervisor's stdout/stderr to the bot's own log
+    file, so a console handler would duplicate every record in that file.
+    """
+    try:
+        return os.path.samefile("/proc/self/fd/1", str(path))
+    except OSError:
+        return False
 
 
 def get_correlation_id() -> str:
@@ -161,17 +174,21 @@ def setup_logging(
     else:
         formatter = TextFormatter(include_correlation_id=True)
 
-    # Console handler
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(formatter)
-    root.addHandler(console)
-
-    # Rotating file handler
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
+    log_file = log_path / "algotrading.log"
 
+    # Console handler — skipped when stdout already *is* that file. `algobot
+    # start` launches the supervisor with stdout/stderr appended to the same
+    # log, so adding both handlers wrote every line twice.
+    if not _stdout_is(log_file):
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(formatter)
+        root.addHandler(console)
+
+    # Rotating file handler
     file_handler = RotatingFileHandler(
-        str(log_path / "algotrading.log"),
+        str(log_file),
         maxBytes=max_bytes,
         backupCount=backup_count,
         encoding="utf-8",

@@ -30,7 +30,7 @@ algobot logs                   # recent logs (algobot logs 200 for more)
 
 **Test:**
 ```bash
-.venv/bin/python -m pytest tests/ -q                # 230 tests
+.venv/bin/python -m pytest tests/ -q                # 256 tests
 bash scripts/check_project_map.sh                   # verify docs in sync
 .venv/bin/python -m compileall -q algotrading       # byte‑compile check
 ```
@@ -38,7 +38,7 @@ bash scripts/check_project_map.sh                   # verify docs in sync
 ## Conventions
 
 - **Configuration:** `config/settings.yaml` (YAML) for non‑secret settings; `.env` (gitignored) for secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS, BINANCE_*, AI_*, API_TOKEN).
-- **Strategies:** Python files in `strategies/`; each defines `evaluate(symbol, candles)` and a `STRATEGY` alias. Hot‑reloaded every 300s.
+- **Strategies:** Python files in `strategies/`; each defines `evaluate(symbol, candles)` and a `STRATEGY` alias. Hot‑reloaded every 300s. `strategies/three_commas_bot.py` is a worked hand-conversion of a Pine v5 script (long-only, signal-driven stops).
 - **Authoring contract (AI or hand-written):** the class must be buildable as `cls(params_dict)` (`def __init__(self, params=None)`), and only the indicator helpers / `math` / `statistics` may be imported (`from algotrading.strategy import indicators as ta`); anything else is refused by `strategy/validation.py`. `create_pending_recommendation` runs the full compile gate, so bad code comes back to the model as tool feedback instead of becoming an unapplicable Approve.
 - **Modules:** Plug‑in capabilities (market, execution, strategy, analytics, control, api) selected via `modules.enabled` in settings.yaml. Locked capabilities (execution) cannot be overridden.
 - **Event sourcing:** Orders write `trade_intent` before exchange call; fills append to immutable `order_events`; positions/trades rebuilt from events on start.
@@ -50,7 +50,8 @@ bash scripts/check_project_map.sh                   # verify docs in sync
 
 - **Secrets:** `.env` must be created (copy from `.env.example`) and filled; never commit it.
 - **Database:** `data/algotrading.db` holds state; backups in `data/backups/` (7‑day retention). Do not edit while bot running.
-- **Heartbeat:** `data/heartbeat` touched every 60s; supervisor loop kills bot if stale >300s. Do not delete manually.
+- **Heartbeat:** `data/heartbeat` touched every 60s; supervisor loop kills bot if stale >300s (grace grows by however long the loop itself was suspended, so a screen-off phone isn't mistaken for a hung bot). Do not delete manually.
+- **Android kills the whole app, not the bot:** on Android 12+ (and forced harder by vendor ROMs, e.g. vivo/iQOO) the entire Termux app is SIGKILLed once it is backgrounded with the screen off — measured here: ~17 min after screen lock, taking the supervisor, the bot, any child watchers and interactive sessions with it. Signature: the log stops mid-tick with no `shutting down…`/`bye` and no watchdog line, and `algobot status` says not running while the db/heartbeat simply stop advancing. The bot cannot prevent this from inside; the levers are the wake lock (requested at startup, demo mode included), battery-optimisation exemption for Termux, and disabling the phantom-process monitor (Android 14: Developer options → *Disable child process restrictions*; or `adb shell settings put global settings_enable_monitor_phantom_procs false`). Keeping the tick cheap matters too: a tick that burns a CPU core is exactly what those killers target.
 - **Single instance:** Supervisor loop uses `data/run_bot.lock`; only one `run_bot.sh` may run. `algobot start` is safe.
 - **Demo mode:** `--demo-data` uses synthetic prices; ignores live Binance and disables live gateway.
 - **AI availability:** Without `AI_API_KEY` *and* without `USE_HERMES=true`, assistant disabled; all other features work. With `USE_HERMES=true` the bot shells out to `hermes chat -q` (needs the CLI on PATH; keep the default terminal-free toolset). The provider occasionally truncates a long answer mid-string; `complete_text` + `salvage_partial_reply` degrade gracefully (partial reply kept, partial tool call still an error).

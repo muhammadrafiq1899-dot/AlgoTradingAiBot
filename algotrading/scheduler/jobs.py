@@ -134,8 +134,14 @@ def market_tick(ctx: BotContext) -> None:
         fetched = 0
         for symbol in settings.market.symbols:
             for interval in settings.market.intervals:
+                # Incremental fetch: ask only for candles at/after the newest one
+                # we hold (plus the still-forming candle). Re-downloading the full
+                # 1000-candle window per symbol/interval every minute is ~1.4 MB
+                # of mobile data and ~14k rows of DB churn per tick — the tick
+                # then takes minutes and never keeps up with its 60s interval.
+                since_ms = store.latest_ts(symbol, interval)
                 try:
-                    candles = ctx.provider.fetch_klines(symbol, interval)
+                    candles = ctx.provider.fetch_klines(symbol, interval, since_ms=since_ms)
                 except Exception as exc:  # noqa: BLE001 - one bad symbol must not kill the tick
                     log.warning("market tick: fetch failed %s %s: %s", symbol, interval, exc)
                     continue

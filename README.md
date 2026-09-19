@@ -17,6 +17,27 @@ Version `0.1.0`.
 
 ## Changelog
 
+### 2026-09-19 — keeps running with the screen off, and stops eating your battery
+
+- **The bot no longer hogs a CPU core.** Every 60-second cycle re-wrote its whole
+  candle history — 14,000 rows, one delete per row — which took minutes and left
+  every later cycle logged as "skipped". It now downloads only the candles it is
+  missing and writes them in one batch: measured on this phone, a cycle went from
+  over 90 seconds at ~100% of a core to about 3 seconds at ~2%. That matters
+  twice over on Android, which singles out background apps that burn CPU.
+- **Why it "force closed" when you turned the screen off — in plain terms.**
+  Android (and the phone maker's battery manager on top of it) kills the whole
+  Termux app, not just this bot, once it has sat in the background with the screen
+  off for a while; measured here: about 17 minutes after locking the screen,
+  taking every Termux session with it. Nothing inside the bot can prevent that, so
+  §12 now lists the phone settings that do. The tell-tale sign is in the log:
+  lines stop mid-cycle with no "shutting down…" and no watchdog message.
+- **`algobot stop` actually stops it.** Stopping while a cycle was in flight used
+  to leave the bot process running invisibly — and the next `algobot start` then
+  ran two bots against one database. It now waits 20 seconds, then kills the group.
+- **No more doubled log lines**, and demo mode (`--demo-data`) keeps the wake lock
+  too, so offline practice runs survive the screen going off.
+
 ### 2026-09-18 — read images, and combine strategies
 
 - **Send a picture in Telegram** (needs `USE_HERMES=true`): a chart, a
@@ -468,6 +489,9 @@ something goes wrong:
 | Approving says "strategy cannot be built as cls(params_dict)" | Generated code used a keyword constructor instead of taking the params dict | Same: refused at propose time with the fix spelled out (also true for hand-written plugins) |
 | An AI-authored strategy sits in `strategies/` but never loads | It failed validation, so the loader skipped it and logged why | `algobot logs 200` shows the reason; fix the constructor shape / imports |
 | The bot keeps restarting | Something crashes on startup | `algobot logs 200` and read the bottom |
+| The bot is gone after the screen was off (and every Termux session restarted with it) | Android killed the whole Termux app — normal on Android 12+, and forced harder by some phone makers | Exempt Termux from battery optimisation (Battery → Unrestricted / "allow background activity"), and on Android 14 turn on Developer options → *Disable child process restrictions*. Keep the app's wake lock on from the Termux notification while the bot runs |
+| `algobot status` says stopped, but the log shows the bot still ticking | An old stop left the bot process behind | `algobot stop` (it now escalates and kills the group), then `algobot start` |
+| Every line in `logs/algotrading.log` appears twice | A bot started outside `algobot start` while the supervisor's log redirect was also open on that file | Harmless; start it with `algobot start` so only one writer owns the log |
 | It replies but formatting looks wrong | Telegram rejected the message | Check the log for parse errors; the bot uses HTML formatting |
 
 The complete technical troubleshooting guide is in

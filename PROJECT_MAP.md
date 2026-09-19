@@ -44,7 +44,7 @@ controlled from Telegram. Modular monolith, one Python process, one asyncio even
 - **Stack constraints (Termux/Android):** no ccxt (pulls Rust `cryptography`), no `openai` SDK
   (pulls Rust `jiter`), pydantic **v1** only, pure-Python indicators (no numpy/pandas).
 - Version: `algotrading/__init__.py` → `__version__ = "0.1.0"`.
-- Tests: `pytest tests/` (230 passing, all M0–M7 milestones; includes a full non-technical-user scenario in `tests/test_scenario_end_to_end.py`).
+- Tests: `pytest tests/` (256 passing, all M0–M7 milestones; includes a full non-technical-user scenario in `tests/test_scenario_end_to_end.py`).
 
 ## 2. How to run
 
@@ -53,13 +53,27 @@ bash scripts/setup_termux.sh            # one-time: pkgs, venv, deps, .env, DB i
 .venv/bin/python -m algotrading.main               # paper mode vs live Binance prices
 .venv/bin/python -m algotrading.main --demo-data   # offline synthetic feed (forces paper)
 .venv/bin/python -m algotrading.main --no-telegram # headless
-bash scripts/run_bot.sh                 # supervised loop: auto-restart + heartbeat watchdog
+bash scripts/run_bot.sh                 # supervised loop: auto-restart + sleep-aware heartbeat watchdog
 .venv/bin/python -m pytest tests/ -q    # test suite
 ```
 
 ⚠️ **Gotcha:** `python -m algotrading.main` must run from the repo root (or any dir — `main.py`
 fixes `sys.path` itself, but `-m` does not). Running `.venv/bin/python -m algotrading/main`
 fails with `No module named algotrading/main` and creates stray `bot.log`-style artifacts.
+
+**Android reality — why the bot "force closes" when the screen goes off.** Android 12+
+(and vendor ROMs such as vivo/iQOO on top of it) kill the **whole Termux app**, not just
+this bot, once it is backgrounded with the screen off — measured on this device: the app
+was SIGKILLed ~17 minutes after the screen was locked, taking the supervisor, the bot,
+the child watchers and any interactive session with it. Tell-tale signature in the log:
+lines stop mid-tick with **no** `shutting down…` / `bye` and **no** watchdog message, and
+every Termux session is gone when you come back. Nothing in the bot can prevent that from
+inside, so the levers are: keep the wake lock held (the bot requests it at startup, demo
+mode included), exempt Termux from battery optimisation, and disable the phantom-process
+monitor (Developer options → *Disable child process restrictions*, or `adb shell settings
+put global settings_enable_monitor_phantom_procs false`). Keep the bot's CPU/IO footprint
+low so the device has no reason to single it out — that is what the incremental fetch and
+batched upsert in §4 are for.
 
 ## 3. Directory map
 
@@ -116,8 +130,9 @@ job (`strategy_plugins_reload`) picks up hand-edits without a restart.
 
 ```
 scheduler.market_tick (algotrading/scheduler/jobs.py)
-  → market.BinanceMarketProvider|DemoProvider.fetch_klines  (algotrading/market/)
-  → CandleStore.upsert → DB table `candles`
+  → market.BinanceMarketProvider|DemoProvider.fetch_klines(since_ms=newest stored)
+  → CandleStore.upsert (incremental: skips rows older than the stored latest, one
+    batched INSERT ... ON CONFLICT DO UPDATE) → DB table `candles`
   → protective exits first: execution.update_trailing_stops (+ execute the sell signals)
   → stale-data freeze check (max_staleness_seconds)
   → strategy.StrategyEngine.evaluate(snapshot)   → DB table `signals` (candidate|skipped)
@@ -181,7 +196,7 @@ Telegram bot runs in the event loop with one session.
 | `algotrading/market/binance_provider.py` | Adapter: REST → `Candle` list with circuit breaker | `BinanceMarketProvider` (uses `CircuitBreaker` for fault tolerance) |
 | `algotrading/market/circuit_breaker.py` | Circuit breaker pattern for external services | `CircuitBreaker`, `CircuitOpenError`, `CircuitState`, `get_circuit`, `reset_all_circuits` |
 | `algotrading/market/demo.py` | Deterministic synthetic feed | `DemoProvider` |
-| `algotrading/market/candles.py` | Persist/query candles, backfill | `CandleStore` (upsert/get/latest_ts/prune), `backfill` |
+| `algotrading/market/candles.py` | Persist/query candles, backfill | `CandleStore` (upsert/get/latest_ts/prune), `backfill`. `upsert` only writes rows at/after the newest stored candle and does it with **one batched `INSERT ... ON CONFLICT DO UPDATE`** — the old per-row `execute(delete(...))` + `add()` loop let autoflush flush the pending batch on every iteration (O(n²): ~10s per 1000 candles, which pinned a full CPU core inside every 60s tick on a phone) |
 | `algotrading/strategy/base.py` | Strategy protocol + signal model | `Signal`, `Strategy` (stateless, pure) |
 | `algotrading/strategy/indicators.py` | Pure-Python TA (no numpy) + indicator registry | `sma`, `ema`, `rsi`, `atr`, `bollinger_bands`, `macd`, `supertrend`, `vwap`, `closes/highs/lows`, `last_valid`, `register_indicator`, `create_indicator` |
 | `algotrading/strategy/validation.py` | One safety gate for AI/user-authored code | `validate_strategy_code`, `validate_indicator_code`, `compile_strategy` (also probes the constructor — see below), `compile_indicator`, `safe_namespace`, `_safe_import`, `CodeValidationError`. Imports allowed: the indicator helpers, `math`, `statistics` — `from algotrading.strategy import indicators as ta`, bare `from indicators import ...`, `import math`; `_import_allowed` is the single rule read by both the AST check and the runtime import hook, and sibling access (`from algotrading.strategy import registry`) is refused. `_check_constructor` rejects a class that cannot be built as `cls(params_dict)` |
@@ -212,14 +227,14 @@ Telegram bot runs in the event loop with one session.
 | `algotrading/api/app.py` | FastAPI factory with enriched health + metrics | `build_api` (`/health`, `/metrics`, `/status`) |
 | `algotrading/api/metrics.py` | Prometheus metrics (optional) | `init_metrics`, `get_metrics`, `record_tick`, `record_signal`, `record_order`, `record_fill`, `tick_timer`, `market_timer`, `execution_timer` |
 | `algotrading/api/auth.py` | Bearer guard (constant-time) | `require_token` |
-| `algotrading/scheduler/jobs.py` | Core periodic jobs + context + module job merge | `BotContext` (with `provide`/`get`/`has`, `services`, `extra_jobs`), `JobSpec`, `market_tick` (runs `_run_trailing_stops` **before** the stale-data gate, so protective exits never depend on fresh entries), `_run_trailing_stops`, `analytics_tick`, `analytics_daily`, `ai_review`, `reconcile_tick`, `heartbeat_tick`, `build_scheduler` |
+| `algotrading/scheduler/jobs.py` | Core periodic jobs + context + module job merge | `BotContext` (with `provide`/`get`/`has`, `services`, `extra_jobs`), `JobSpec`, `market_tick` (runs `_run_trailing_stops` **before** the stale-data gate, so protective exits never depend on fresh entries; fetches incrementally with `since_ms = newest stored candle` per symbol/interval instead of re-downloading the full 1000-candle window every minute), `_run_trailing_stops`, `analytics_tick`, `analytics_daily`, `ai_review`, `reconcile_tick`, `heartbeat_tick`, `build_scheduler` |
 | `algotrading/supervisor/health.py` | Heartbeat file + wake-lock | `HealthMonitor`, `ensure_wake_lock` |
 | `algotrading/supervisor/reconcile.py` | Intents vs exchange drift check | `reconcile`, `reconcile_and_report` |
 | `algotrading/backtest/runner.py` | Replay candles through a strategy | `run_backtest`, `BacktestResult`, `BacktestTrade` |
 | `algotrading/backtest/stored.py` | Load stored candles for a backtest (shared DB adapter) | `load_candles` → `(symbol, interval, candles)`, `resolve_market`, `DEFAULT_LIMIT` |
-| `algotrading/cli_setup.py` | .env + wizard + `algobot` subcommands | `read_env/write_env`, `prompt_for_fields`, `start/stop/status/show_logs/menu/run_setup` |
+| `algotrading/cli_setup.py` | .env + wizard + `algobot` subcommands | `read_env/write_env`, `prompt_for_fields`, `start/stop/status/show_logs/menu/run_setup`. `stop()` SIGTERMs the process group, waits `STOP_GRACE_SECONDS` (20s) and then SIGKILLs it — a tick stuck in an exchange call used to keep the python child alive after the supervisor died (a "stopped" bot still burning CPU, then two bots on one DB after the next start) |
 | `scripts/setup_termux.sh` | Full Termux bootstrap (installs `algobot`) | — |
-| `scripts/run_bot.sh` | Supervisor loop: restart + heartbeat watchdog (300s grace period before it can kill; single-instance lock via `data/run_bot.lock`); auto SQLite backup before each start (`data/backups/`, 7-day retention) | — |
+| `scripts/run_bot.sh` | Supervisor loop: restart + heartbeat watchdog (300s grace period before it can kill, extended by however long this loop itself was suspended — a screen-off phone must not look like a hung bot; single-instance lock via `data/run_bot.lock`); auto SQLite backup before each start (`data/backups/`, 7-day retention) | — |
 | `scripts/init_db.py` | Create DB + seed (idempotent) | — |
 | `scripts/setup.py`, `scripts/algobot` | Thinnest wrappers over `cli_setup` | — |
 | `config/settings.yaml` | All tunables: mode, universe, risk, schedule, AI, API | — |
@@ -286,6 +301,7 @@ Migration hook: `SCHEMA_VERSION` in `algotrading/db/__init__.py` (bump + add mig
 | Strategy param hot-reload | `strategy/engine.py` `_maybe_reload_strategy()` + `config/settings.yaml` `strategy.hot_reload` (gated, off by default) |
 | Prometheus /metrics endpoint | `api/metrics.py` + `api/app.py` `/metrics` (optional, gated by `metrics.enabled`, requires prometheus-client) |
 | Trailing stop support | `execution/risk.py` + `execution/engine.py` + `config/settings.yaml` `risk.trailing_stop_pct` (optional, gated); `scheduler/jobs.py` `_run_trailing_stops` runs it every tick before the stale gate and executes the returned protective sells |
+| Convert a Pine Script strategy into the bot | `strategies/three_commas_bot.py` is a worked example: same loader/validator/approval path as any plugin (`strategies/README.md` has the contract — `cls(params_dict)`, `evaluate(symbol, candles)`, indicator/math imports only). Long-only spot: map Pine shorts to exits, and turn broker stop/limit orders into sell signals |
 | Verify the whole product as a user | `tests/test_scenario_end_to_end.py` — the end-to-end journey (setup → trade → every command → AI approval → API → restart) |
 | Ensemble/filter strategies | `strategy/starters.py` `EnsembleStrategy` + `config/strategies.yaml` `ensemble` + `store/recommendations.py` `ensemble_strategy`/`filter_strategy` kinds (consensus/any/filter/weighted modes) |
 
@@ -362,6 +378,7 @@ deterministic fix.
 | `test_modules.py` | module resolution, external loading, lifecycle, job contribution, execution lock |
 | `test_strategy_plugins.py` | plugin load/write/edit, code-safety rejection (including the import allowlist: documented form works, bare `indicators` is aliased, siblings/os are refused), constructor shape (`cls(params_dict)` probe), propose-time gate for uncompilable code, failed-write cleanup, hot-reload, AI authoring flow, ensemble components: an AI-authored plugin combines (and an unknown name still fails) |
 | `test_scenario_end_to_end.py` | **Full non-technical-user scenario**: setup wizard, module composition, a real entry + trailing-stop exit (regression: protective exits run with no candidates, NULL `highest_price`, `CandleStore.latest` never existed), every Telegram command + backtest button + approve/reject, chat-driven `new_strategy` approval, analytics, API, restart rebuild |
+| `test_three_commas_bot.py` | The Pine v5 "3Commas Bot" port in `strategies/three_commas_bot.py`: real-loader contract, catalog metadata/ranges, entry + MA-cross exit, ATR swing stop, R:R target, ATR trailing exit (and that it beats the static stop on a reversal), rr_exit arming, session (incl. wrap-around) and date filters, all nine MA types, and activation through an approved `param_change` |
 
 ## 10. Keeping this map in sync (git hook / CI)
 
